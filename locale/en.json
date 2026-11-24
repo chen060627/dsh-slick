@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Enhancement kit",
+    "description": "A kit of conversation enhancements: pasted tables become real .xlsx, long plain text becomes .txt, draft images open in an annotation editor (pen, box, circle, line, arrow, eraser; shapes can be moved and resized), Enter steers while the agent runs, plus a reasoning-effort slider and agent teamwork. Each is toggled in Settings → Enhancement kit and stored per browser.",
+    "detail": "docs/DETAIL.md"
+  }
+}

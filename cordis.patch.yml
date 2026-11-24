@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-slick
+      name: 'dsh-slick'
+      config:
+        threshold: 500
+        autoSendImage: true

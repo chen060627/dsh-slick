@@ -1,0 +1,55 @@
+{
+  "name": "dsh-slick",
+  "version": "1.0.0",
+  "private": false,
+  "description": "A kit of DeepSeek Harness conversation enhancements: paste-to-file conversion, in-place image annotation, Enter-to-steer, and a Codex-style reasoning-effort slider.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Sam"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin",
+    "annotation",
+    "xlsx",
+    "reasoning-effort",
+    "slider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sam/dsh-slick.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sam/dsh-slick/issues"
+  },
+  "homepage": "https://github.com/Sam/dsh-slick#readme",
+  "engines": {
+    "dsh": "*"
+  }
+}

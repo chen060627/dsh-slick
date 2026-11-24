@@ -1,0 +1,2596 @@
+/**
+ * Browser half: composer tools.
+ *
+ * Paste: tab-separated table text becomes a real .xlsx attachment, other long plain text becomes
+ * a .txt attachment. Image: a click on a composer draft image opens a frame-wide editor on that
+ * exact image, and Save writes a NEW PNG that replaces the draft. Both hand off through the
+ * Conversation service's `createDrafts(…, uploadImages: true)` plus the session input's
+ * `addAttachments()`. The source image is never modified.
+ */
+window.__ModuleLoader__.load({
+  id: 'dsh-slick',
+  factory(require) {
+    'use strict';
+
+    const PACKAGE = 'dsh-slick';
+    /** Build stamp: proves which bundle the page actually loaded. */
+    const BUILD = 'dsh-slick-1.0.0';
+    const React = require('react');
+    const ReactDOM = require('react-dom');
+    const h = React.createElement;
+    /** Table and long-text decisions from the inlined format module. */
+    const FORMAT = globalThis.__composerToolsFormat;
+
+    /** Client plugin context, captured at apply time. */
+    let pluginCtx = null;
+
+    // ---- user settings -------------------------------------------------------------------
+    //
+    // The row config in the profile patch owns the deployment defaults; the Settings page
+    // (Settings → 增强工具集) stores per-browser overrides on top of them. Values are read
+    // live by the paste and annotation paths, so a change applies without reloading the page.
+
+    const SETTINGS_KEY = 'dsh-slick:settings';
+    /** Bumped when the stored shape changes; older blobs are ignored so defaults come back. */
+    const SETTINGS_VERSION = 2;
+    /**
+     * Stop labels, low to high. `off` is the minimum: it means "no delegation" (a single active
+     * subagent slot / depth 1), which is also why it carries the smallest number.
+     */
+    const STOP_LABELS = ['off', 'Low', 'Medium', 'High', 'Xhigh', 'Max'];
+    /** Bumped whenever the shipped stop numbers change, so stale browser values are dropped. */
+    const STOPS_VERSION = 4;
+    /**
+     * Subagent-count stops. The user picks how many are shown (1–6) and each value independently;
+     * the labels are the tail of STOP_LABELS, so 5 stops read Low … Max and 6 include off.
+     */
+    const DEFAULT_SUBAGENT_STOPS = {
+      count: 5,
+      // One value per label slot (off, Low, Medium, High, Xhigh, Max). The defaults give
+      // Low=1 Medium=3 High=5 Xhigh=10 Max=20; off stays 0 (no delegation).
+      values: [0, 1, 3, 5, 10, 20],
+    };
+    /** Default per-stop speed multipliers, one per stop label (off … Max). */
+    /** Index of the Medium stop, used by the teamwork coupling. */
+    const MEDIUM_INDEX = 2;
+    /** Index of the Low stop; off and Low both drop teamwork. */
+    const LOW_INDEX = 1;
+    const SETTINGS_DEFAULTS = {
+      tableToXlsx: true,
+      threshold: 500,
+      autoSendImage: true,
+      /** On: our slider + lightning replace the official reasoning row and teamwork switch. */
+      effortSliderOn: true,
+      /** When on, the 子代理数 stop is injected into the prompt as a hard requirement. */
+      forceSubagentCount: true,
+      subagentStops: DEFAULT_SUBAGENT_STOPS,
+    };
+    /** Defaults resolved from the row config at apply time, used by "恢复默认". */
+    let settingsBase = { ...SETTINGS_DEFAULTS };
+    /** Effective values: row-config defaults with stored overrides folded in. */
+    let settings = { ...SETTINGS_DEFAULTS };
+    const settingsListeners = new Set();
+
+
+    /** @returns {any} stored partial settings, or an empty object when storage is unavailable. */
+    function readStoredSettings() {
+      try {
+        const raw = window.localStorage.getItem(SETTINGS_KEY);
+        const parsed = raw === null ? null : JSON.parse(raw);
+        return parsed !== null && typeof parsed === 'object' ? parsed : {};
+      } catch {
+        return {};
+      }
+    }
+
+    /**
+     * Keep a stop list as five positive integers, falling back per entry.
+     * @param {any} raw - stored value.
+     * @param {number[]} fallback - default stops.
+     * @returns {number[]} five usable stop values.
+     */
+    function sanitizeStops(raw, fallback) {
+      const list = Array.isArray(raw) ? raw : [];
+      return fallback.map((value, index) => {
+        const parsed = Math.floor(Number(list[index]));
+        return Number.isFinite(parsed) && parsed >= 1 ? parsed : value;
+      });
+    }
+
+    /**
+     * @param {any} base - defaults from the row config.
+     * @returns {any} base with valid stored overrides applied.
+     */
+    function mergeStoredSettings(base) {
+      const stored = readStoredSettings();
+      if (Number(stored.v) !== SETTINGS_VERSION) return { ...base };
+      const threshold = Number(stored.threshold);
+      // Bumping this drops stop numbers saved by an older default set.
+      const stopsVersion = Number(stored.stopsV);
+      const storedStops = stopsVersion === STOPS_VERSION && stored.subagentStops !== null
+        && typeof stored.subagentStops === 'object'
+        ? stored.subagentStops
+        : {};
+      const baseStops = base.subagentStops ?? DEFAULT_SUBAGENT_STOPS;
+      return {
+        tableToXlsx: typeof stored.tableToXlsx === 'boolean' ? stored.tableToXlsx : base.tableToXlsx,
+        threshold: Number.isFinite(threshold) && threshold >= 0 ? Math.floor(threshold) : base.threshold,
+        autoSendImage: typeof stored.autoSendImage === 'boolean' ? stored.autoSendImage : base.autoSendImage,
+        effortSliderOn: typeof stored.effortSliderOn === 'boolean' ? stored.effortSliderOn : base.effortSliderOn,
+        forceSubagentCount: typeof stored.forceSubagentCount === 'boolean'
+          ? stored.forceSubagentCount
+          : base.forceSubagentCount,
+        subagentStops: {
+          count: sanitizeStopCount(storedStops.count, baseStops.count ?? DEFAULT_SUBAGENT_STOPS.count),
+          values: sanitizeStopValues(storedStops.values, baseStops.values ?? DEFAULT_SUBAGENT_STOPS.values),
+        },
+      };
+    }
+
+    /**
+     * Keep a per-stop speed list as six values between 0.1 and 6.
+     * @param {any} raw - stored value.
+     * @param {number[]} fallback - defaults.
+     * @returns {number[]} six usable multipliers.
+     */
+    function sanitizeStarSpeeds(raw, fallback) {
+      const list = Array.isArray(raw) ? raw : [];
+      return fallback.map((value, index) => {
+        const parsed = Number(list[index]);
+        return Number.isFinite(parsed) && parsed > 0.05 ? Math.min(6, parsed) : value;
+      });
+    }
+
+    /**
+     * Clamp the visible stop count to 1–6.
+     * @param {any} raw - stored value.
+     * @param {number} fallback - default count.
+     * @returns {number} a usable count.
+     */
+    function sanitizeStopCount(raw, fallback) {
+      const parsed = Math.floor(Number(raw));
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.max(1, Math.min(STOP_LABELS.length, parsed));
+    }
+
+    /**
+     * Normalise the six stored stop values (only the last `count` are shown).
+     * @param {any} raw - stored array.
+     * @param {number[]} fallback - defaults.
+     * @returns {number[]} six positive integers.
+     */
+    function sanitizeStopValues(raw, fallback) {
+      const list = Array.isArray(raw) ? raw : [];
+      const base = Array.isArray(fallback) ? fallback : DEFAULT_SUBAGENT_STOPS.values;
+      return STOP_LABELS.map((label, index) => {
+        const parsed = Math.floor(Number(list[index]));
+        if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+        const fallbackValue = Math.floor(Number(base[index]));
+        return Number.isFinite(fallbackValue) && fallbackValue >= 0 ? fallbackValue : index;
+      });
+    }
+
+    /**
+     * The visible stops: the last `count` labels paired with their values, so raising the count
+     * adds a smaller stop in front instead of renumbering everything.
+     * @param {any} values - the settings snapshot.
+     * @returns {{label: string, value: number}[]} the stops to draw.
+     */
+    function stopsOf(values) {
+      const store = values?.subagentStops ?? DEFAULT_SUBAGENT_STOPS;
+      const count = sanitizeStopCount(store.count, DEFAULT_SUBAGENT_STOPS.count);
+      const numbers = sanitizeStopValues(store.values, DEFAULT_SUBAGENT_STOPS.values);
+      const labels = STOP_LABELS.slice(STOP_LABELS.length - count);
+      return labels.map((label, index) => ({
+        label,
+        value: numbers[numbers.length - count + index],
+      }));
+    }
+
+    /**
+     * Persist a partial change and apply it immediately.
+     * @param {any} next - fields to change.
+     * @returns {void} nothing.
+     */
+    function updateSettings(next) {
+      settings = { ...settings, ...next };
+      try {
+        window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+          ...readStoredSettings(),
+          ...next,
+          v: SETTINGS_VERSION,
+          stopsV: STOPS_VERSION,
+        }));
+      } catch {
+        // Storage can be unavailable; the value still applies for this page session.
+      }
+      for (const listener of settingsListeners) listener();
+    }
+
+    /** Drop every stored override and return to the row config. @returns {void} nothing. */
+    function resetSettings() {
+      try {
+        window.localStorage.removeItem(SETTINGS_KEY);
+      } catch {
+        // Nothing to clear.
+      }
+      settings = { ...settingsBase };
+      for (const listener of settingsListeners) listener();
+    }
+
+    const subscribeSettings = (listener) => {
+      settingsListeners.add(listener);
+      return () => { settingsListeners.delete(listener); };
+    };
+    const readSettings = () => settings;
+
+    const COLORS = ['#e5484d', '#f5a524', '#30a46c', '#3b82f6', '#111111'];
+    /** Stroke width bounds: the toolbar slider is continuous between them. */
+    const WIDTH_MIN = 1;
+    const WIDTH_MAX = 24;
+    const WIDTH_DEFAULT = 4;
+    /** Eraser reach as a share of the image width. */
+    const ERASER_RATIO = 0.02;
+
+    // ---- open state shared by the rail and the overlay ------------------------------------
+
+    let open = false;
+    /** Draft image being edited: its browser-owned File, draft id, and Session. */
+    let pendingEdit = null;
+    const openListeners = new Set();
+    /** @param {boolean} next - whether the editor is showing. */
+    function setOpen(next) {
+      open = next;
+      for (const listener of openListeners) listener();
+    }
+    const subscribeOpen = (listener) => {
+      openListeners.add(listener);
+      return () => { openListeners.delete(listener); };
+    };
+    const readOpen = () => open;
+
+    /**
+     * Cursor images for the canvas. The OS crosshair is XOR-drawn, so over a light picture it turns
+     * white and disappears; a two-tone SVG plus (white halo under a dark core) stays visible on any
+     * colour. Percent-encoded so the whole rule survives a plain single-quoted string.
+     */
+    const PLUS_CURSOR = 'url("data:image/svg+xml;charset=utf-8,'
+      + '%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2725%27 height=%2725%27 viewBox=%270 0 25 25%27%3E'
+      + '%3Cpath d=%27M12.5 2v21M2 12.5h21%27 fill=%27none%27 stroke=%27%23fff%27 stroke-width=%274.5%27 stroke-linecap=%27round%27/%3E'
+      + '%3Cpath d=%27M12.5 3v19M3 12.5h19%27 fill=%27none%27 stroke=%27%23111%27 stroke-width=%271.4%27 stroke-linecap=%27round%27/%3E'
+      + '%3C/svg%3E")';
+    const RING_CURSOR = 'url("data:image/svg+xml;charset=utf-8,'
+      + '%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2725%27 height=%2725%27 viewBox=%270 0 25 25%27%3E'
+      + '%3Ccircle cx=%2712.5%27 cy=%2712.5%27 r=%278%27 fill=%27none%27 stroke=%27%23fff%27 stroke-width=%274.5%27/%3E'
+      + '%3Ccircle cx=%2712.5%27 cy=%2712.5%27 r=%278%27 fill=%27none%27 stroke=%27%23111%27 stroke-width=%271.4%27/%3E'
+      + '%3C/svg%3E")';
+
+    const CSS = [
+      '.ia-rail{display:flex;gap:8px;overflow-x:auto;padding:6px 2px;scrollbar-width:none}',
+      '.ia-rail::-webkit-scrollbar{display:none}',
+      '.ia-item{position:relative;flex:0 0 auto}',
+      '.ia-thumb{display:block;width:64px;height:64px;padding:0;overflow:hidden;cursor:pointer;',
+      'border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.12));border-radius:10px;background:#fff}',
+      '.ia-thumb img{width:100%;height:100%;object-fit:cover;display:block}',
+      '.ia-thumb:hover{border-color:var(--dsw-alias-brand-primary,#3b82f6)}',
+      '.ia-tools{position:absolute;top:3px;right:3px;display:flex;gap:3px}',
+      '.ia-mini{width:18px;height:18px;padding:0;display:inline-flex;align-items:center;justify-content:center;',
+      'border:0;border-radius:9px;cursor:pointer;font-size:11px;line-height:1;color:#fff;background:rgba(0,0,0,.55)}',
+      '.ia-mini:hover{background:rgba(0,0,0,.78)}',
+      '.ia-file{display:flex;align-items:center;gap:8px;height:64px;padding:0 10px;border-radius:10px;cursor:default;',
+      'border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.04))}',
+      '.ia-file-name{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}',
+      '.ia-file-meta{font-size:11px;opacity:.7}',
+      '.ia-progress{position:absolute;left:0;right:0;bottom:0;height:3px;border-radius:0 0 10px 10px;background:rgba(0,0,0,.12)}',
+      '.ia-progress span{display:block;height:100%;background:var(--dsw-alias-brand-primary,#3b82f6)}',
+      '.ia-mask{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;',
+      'background:rgba(0,0,0,.5);padding:20px}',
+      '.ia-card{display:flex;flex-direction:column;gap:12px;width:min(96vw,1160px);max-height:94vh;',
+      'padding:12px;border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);',
+      'color:var(--dsw-alias-label-primary,#111);box-shadow:0 18px 48px rgba(0,0,0,.3)}',
+      /* Toolbar sits on its own surface, clearly separated from the picture. */
+      '.ia-toolbar{display:flex;flex-direction:column;gap:8px;padding:8px 10px 10px;border-radius:12px;',
+      'background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.045));',
+      'border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.1))}',
+      '.ia-bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px}',
+      '.ia-bar-title{font-size:12px;font-weight:600;margin-right:6px}',
+      '.ia-tool,.ia-act{font-size:12px;line-height:1;padding:6px 9px;border-radius:8px;cursor:pointer;',
+      'border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);',
+      'color:inherit}',
+      '.ia-tool[data-on="1"]{border-color:var(--dsw-alias-brand-primary,#3b82f6);color:var(--dsw-alias-brand-primary,#3b82f6)}',
+      '.ia-act[disabled]{opacity:.45;cursor:default}',
+      '.ia-swatch{width:20px;height:20px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0}',
+      '.ia-swatch[data-on="1"]{border-color:var(--dsw-alias-label-primary,#111)}',
+      /* Live ink sample: a dot for the pen and a square outline for the box. */
+      'transition:border-color .12s ease,border-width .12s ease}',
+      'transition:border-color .12s ease,border-width .12s ease}',
+      /* Header close control: a quiet ✕ instead of a labelled button. */
+      '.ia-close{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;',
+      'border:1px solid transparent;border-radius:8px;background:transparent;cursor:pointer;',
+      'color:var(--dsw-alias-label-secondary,#666);transition:color .12s ease,background .12s ease}',
+      '.ia-close:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.08));',
+      'color:var(--dsw-alias-label-primary,#111)}',
+      /* One continuous control row: thin dividers group without splitting it. */
+      '.ia-div{width:1px;height:18px;flex:none;margin:0 2px;background:var(--dsw-alias-border-1,rgba(0,0,0,.12))}',
+      '.ia-width{display:inline-flex;align-items:center;gap:6px;font-size:11px;',
+      'color:var(--dsw-alias-label-secondary,#666)}',
+      '.ia-range{width:92px;height:16px;margin:0;accent-color:var(--dsw-alias-brand-primary,#3b82f6);cursor:pointer}',
+      '.ia-width-value{min-width:18px;text-align:right;font-variant-numeric:tabular-nums}',
+      /* The picture gets its own frame, inset and outlined so it never reads as toolbar. */
+      '.ia-stage{position:relative;display:flex;align-items:center;justify-content:center;width:100%;',
+      'min-height:240px;padding:10px;border-radius:12px;overflow:hidden;',
+      /* Past fit size the stage scrolls instead of clipping, so the zoomed-in image can be panned. */
+      '.ia-stage[data-zoomed="1"]{overflow:auto;align-items:flex-start;justify-content:flex-start}',
+      'border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.14));',
+      'background:var(--dsw-alias-bg-base,#f4f5f7)}',
+      '.ia-canvas{display:block;cursor:' + PLUS_CURSOR + ' 12 12,crosshair;touch-action:none;background:#fff;',
+      'border-radius:6px;box-shadow:0 1px 6px rgba(0,0,0,.16)}',
+      '.ia-canvas[data-tool="eraser"]{cursor:' + RING_CURSOR + ' 12 12,cell}',
+      '.ia-empty{display:flex;flex-direction:column;align-items:center;gap:8px;padding:44px 24px;text-align:center;font-size:13px;',
+      'color:var(--dsw-alias-label-secondary,#666)}',
+      '.ia-empty strong{font-size:14px}',
+      '.ia-pick{font-size:13px;padding:7px 12px;border-radius:9px;cursor:pointer;border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.12));',
+      'background:var(--dsw-alias-bg-layer-1,#fff);color:inherit}',
+      '.ia-hint{font-size:11px;color:var(--dsw-alias-label-secondary,#666)}',
+      '.ia-error{font-size:12px;color:var(--dsw-alias-state-error-primary,#e5484d)}',
+      '.ia-grow{flex:1}',
+    ].join('');
+
+    /**
+     * @param {Date} date - save time.
+     * @returns {string} file name, e.g. `annotated-20261118-091500.png`.
+     */
+    function fileName(date) {
+      const pad = (value) => String(value).padStart(2, '0');
+      return `annotated-${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}`
+        + `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.png`;
+    }
+
+    /**
+     * @param {Blob} blob - image bytes.
+     * @returns {Promise<HTMLImageElement>} decoded image.
+     */
+    function decode(blob) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
+        const image = new Image();
+        image.onload = () => {
+          URL.revokeObjectURL(url);
+          resolve(image);
+        };
+        image.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error('decode failed'));
+        };
+        image.src = url;
+      });
+    }
+
+    /**
+     * Draw one mark.
+     * @param {CanvasRenderingContext2D} surface - target context.
+     * @param {any} stroke - mark description.
+     * @returns {void} nothing.
+     */
+    function paintStroke(surface, stroke) {
+      const points = stroke.points;
+      surface.save();
+      surface.strokeStyle = stroke.color;
+      surface.fillStyle = stroke.color;
+      surface.lineCap = 'round';
+      surface.lineJoin = 'round';
+      surface.lineWidth = stroke.width;
+      if (stroke.tool === 'pen') {
+        if (points.length === 1) {
+          surface.beginPath();
+          surface.arc(points[0].x, points[0].y, stroke.width / 2, 0, Math.PI * 2);
+          surface.fill();
+        } else {
+          surface.beginPath();
+          surface.moveTo(points[0].x, points[0].y);
+          for (let index = 1; index < points.length; index++) surface.lineTo(points[index].x, points[index].y);
+          surface.stroke();
+        }
+      } else if (stroke.tool === 'rect') {
+        const first = points[0];
+        const last = points[points.length - 1];
+        surface.strokeRect(
+          Math.min(first.x, last.x), Math.min(first.y, last.y),
+          Math.abs(last.x - first.x), Math.abs(last.y - first.y),
+        );
+      } else if (stroke.tool === 'circle') {
+        // Ellipse inscribed in the drag box, so a quick drag gives an oval highlight.
+        const first = points[0];
+        const last = points[points.length - 1];
+        const cx = (first.x + last.x) / 2;
+        const cy = (first.y + last.y) / 2;
+        const rx = Math.abs(last.x - first.x) / 2;
+        const ry = Math.abs(last.y - first.y) / 2;
+        surface.beginPath();
+        surface.ellipse(cx, cy, Math.max(1, rx), Math.max(1, ry), 0, 0, Math.PI * 2);
+        surface.stroke();
+      } else if (stroke.tool === 'line') {
+        const first = points[0];
+        const last = points[points.length - 1];
+        surface.beginPath();
+        surface.moveTo(first.x, first.y);
+        surface.lineTo(last.x, last.y);
+        surface.stroke();
+      } else if (stroke.tool === 'arrow') {
+        const first = points[0];
+        const last = points[points.length - 1];
+        const angle = Math.atan2(last.y - first.y, last.x - first.x);
+        const head = Math.max(10, stroke.width * 4);
+        surface.beginPath();
+        surface.moveTo(first.x, first.y);
+        surface.lineTo(last.x, last.y);
+        surface.stroke();
+        surface.beginPath();
+        surface.moveTo(last.x, last.y);
+        surface.lineTo(last.x - head * Math.cos(angle - Math.PI / 7), last.y - head * Math.sin(angle - Math.PI / 7));
+        surface.moveTo(last.x, last.y);
+        surface.lineTo(last.x - head * Math.cos(angle + Math.PI / 7), last.y - head * Math.sin(angle + Math.PI / 7));
+        surface.stroke();
+      }
+      surface.restore();
+    }
+
+    /**
+     * Distance from a point to a line segment.
+     * @param {{x: number, y: number}} point - the point.
+     * @param {{x: number, y: number}} a - segment start.
+     * @param {{x: number, y: number}} b - segment end.
+     * @returns {number} the distance in canvas units.
+     */
+    function segmentDistance(point, a, b) {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const lengthSq = dx * dx + dy * dy;
+      if (lengthSq === 0) return Math.hypot(point.x - a.x, point.y - a.y);
+      let t = ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSq;
+      t = t < 0 ? 0 : (t > 1 ? 1 : t);
+      return Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
+    }
+
+    /**
+     * @param {any} stroke - mark description.
+     * @param {{x: number, y: number}} point - eraser position.
+     * @param {number} reach - eraser radius.
+     * @returns {boolean} whether the mark is under the eraser.
+     */
+    function strokeHit(stroke, point, reach) {
+      const points = stroke.points;
+      const limit = reach + stroke.width;
+      if (stroke.tool === 'rect') {
+        const first = points[0];
+        const last = points[points.length - 1];
+        return point.x >= Math.min(first.x, last.x) - limit && point.x <= Math.max(first.x, last.x) + limit
+          && point.y >= Math.min(first.y, last.y) - limit && point.y <= Math.max(first.y, last.y) + limit;
+      }
+      if (stroke.tool === 'circle') {
+        // Hit the drawn ring itself: normalise into the ellipse and test a band around radius 1.
+        const first = points[0];
+        const last = points[points.length - 1];
+        const rx = Math.max(1, Math.abs(last.x - first.x) / 2);
+        const ry = Math.max(1, Math.abs(last.y - first.y) / 2);
+        const nx = (point.x - (first.x + last.x) / 2) / rx;
+        const ny = (point.y - (first.y + last.y) / 2) / ry;
+        const normalized = Math.sqrt(nx * nx + ny * ny);
+        const band = limit / Math.max(rx, ry);
+        return Math.abs(normalized - 1) <= band;
+      }
+      if (stroke.tool === 'line' || stroke.tool === 'arrow') {
+        return segmentDistance(point, points[0], points[points.length - 1]) <= limit;
+      }
+      for (const sample of points) {
+        const dx = sample.x - point.x;
+        const dy = sample.y - point.y;
+        if (dx * dx + dy * dy <= limit * limit) return true;
+      }
+      return false;
+    }
+
+    /**
+     * Bounding box of one mark, used by the selection handles.
+     * @param {any} stroke - mark description.
+     * @returns {{x: number, y: number, w: number, h: number}} the box in canvas units.
+     */
+    function boundsOf(stroke) {
+      const points = stroke.points;
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const sample of points) {
+        minX = Math.min(minX, sample.x);
+        minY = Math.min(minY, sample.y);
+        maxX = Math.max(maxX, sample.x);
+        maxY = Math.max(maxY, sample.y);
+      }
+      const pad = stroke.width / 2;
+      return { x: minX - pad, y: minY - pad, w: (maxX - minX) + pad * 2, h: (maxY - minY) + pad * 2 };
+    }
+
+    /** Handle order around a selection box: corners first, then edge midpoints. */
+    const HANDLE_NAMES = ['nw', 'ne', 'se', 'sw', 'n', 'e', 's', 'w'];
+
+    /**
+     * @param {{x: number, y: number, w: number, h: number}} box - selection box.
+     * @returns {{name: string, x: number, y: number}[]} handle centres.
+     */
+    function handlesOf(box) {
+      const { x, y, w, h } = box;
+      return [
+        { name: 'nw', x, y },
+        { name: 'ne', x: x + w, y },
+        { name: 'se', x: x + w, y: y + h },
+        { name: 'sw', x, y: y + h },
+        { name: 'n', x: x + w / 2, y },
+        { name: 'e', x: x + w, y: y + h / 2 },
+        { name: 's', x: x + w / 2, y: y + h },
+        { name: 'w', x, y: y + h / 2 },
+      ];
+    }
+
+    /**
+     * Move or resize one mark so its old bounds become the new ones.
+     * @param {any} stroke - mark to transform.
+     * @param {{x: number, y: number, w: number, h: number}} from - old box.
+     * @param {{x: number, y: number, w: number, h: number}} to - new box.
+     * @returns {void} nothing.
+     */
+    function transformStroke(stroke, from, to) {
+      const sx = from.w === 0 ? 1 : to.w / from.w;
+      const sy = from.h === 0 ? 1 : to.h / from.h;
+      for (const sample of stroke.points) {
+        sample.x = to.x + (sample.x - from.x) * sx;
+        sample.y = to.y + (sample.y - from.y) * sy;
+      }
+    }
+
+    /**
+     * Apply one handle drag to a selection box.
+     * @param {{x: number, y: number, w: number, h: number}} box - box before the drag.
+     * @param {string} handle - handle name.
+     * @param {{x: number, y: number}} point - current pointer position.
+     * @returns {{x: number, y: number, w: number, h: number}} the resized box.
+     */
+    function resizeBox(box, handle, point) {
+      let left = box.x;
+      let top = box.y;
+      let right = box.x + box.w;
+      let bottom = box.y + box.h;
+      if (handle.includes('w')) left = point.x;
+      if (handle.includes('e')) right = point.x;
+      if (handle.includes('n')) top = point.y;
+      if (handle.includes('s')) bottom = point.y;
+      return {
+        x: Math.min(left, right),
+        y: Math.min(top, bottom),
+        w: Math.abs(right - left),
+        h: Math.abs(bottom - top),
+      };
+    }
+
+    /** Screen-space size of one selection handle, in CSS pixels. */
+    const HANDLE_SIZE = 9;
+
+    /**
+     * Draw the selection outline and its handles for one mark.
+     * @param {CanvasRenderingContext2D} surface - target context.
+     * @param {any} stroke - the selected mark.
+     * @param {number} canvasWidth - canvas width, used to keep handles a constant on-screen size.
+     * @returns {void} nothing.
+     */
+    function drawSelection(surface, stroke, canvasWidth) {
+      const box = boundsOf(stroke);
+      const size = Math.max(7, Math.round(canvasWidth / 90));
+      const line = Math.max(1.5, canvasWidth / 900);
+      surface.save();
+      surface.strokeStyle = '#3b82f6';
+      surface.lineWidth = line;
+      surface.setLineDash([6, 4]);
+      surface.strokeRect(box.x, box.y, box.w, box.h);
+      surface.setLineDash([]);
+      for (const handle of handlesOf(box)) {
+        surface.fillStyle = '#ffffff';
+        surface.strokeStyle = '#3b82f6';
+        surface.lineWidth = line;
+        surface.beginPath();
+        surface.rect(handle.x - size / 2, handle.y - size / 2, size, size);
+        surface.fill();
+        surface.stroke();
+      }
+      surface.restore();
+    }
+
+    /**
+     * Which handle, if any, sits under a canvas-space point.
+     * @param {{x: number, y: number, w: number, h: number}} box - selection box.
+     * @param {{x: number, y: number}} point - pointer in canvas units.
+     * @param {number} tolerance - grab radius in canvas units.
+     * @returns {string|null} handle name, or null.
+     */
+    function handleAt(box, point, tolerance) {
+      for (const handle of handlesOf(box)) {
+        if (Math.abs(point.x - handle.x) <= tolerance && Math.abs(point.y - handle.y) <= tolerance) {
+          return handle.name;
+        }
+      }
+      return null;
+    }
+
+    /**
+     * @param {any} ctx - client plugin context.
+     * @returns {string|null} the Session the composer shows, preferring the rendered Session.
+     */
+    function domSessionId() {
+      try {
+        const node = document.querySelector('[data-conversation-session]');
+        if (node !== null) {
+          const value = node.getAttribute('data-conversation-session');
+          if (value !== null && value !== '') return value;
+        }
+      } catch {
+        // Fall through to the service snapshot.
+      }
+      return null;
+    }
+
+    /**
+     * @param {any} ctx - client plugin context.
+     * @returns {string|null} the current Session identity.
+     */
+    function currentSessionId(ctx) {
+      const fromDom = domSessionId();
+      if (fromDom !== null) return fromDom;
+      try {
+        const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : ctx.sessions;
+        const current = sessions?.list?.getSnapshot?.().current;
+        if (current) return String(current);
+      } catch {
+        // No Session is available.
+      }
+      return null;
+    }
+
+    /**
+     * @param {any} conversation - Conversation service.
+     * @param {string} sessionId - Session identity.
+     * @returns {any} the session input shell, or null.
+     */
+    function inputShellOf(conversation, sessionId) {
+      try {
+        const shell = conversation?.input?.shell?.(sessionId);
+        return shell && (typeof shell.addAttachments === 'function' || shell.state !== undefined) ? shell : null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * Draft image attachments of one Session, with their browser-owned files.
+     * @param {any} ctx - client plugin context.
+     * @param {string} sessionId - Session identity.
+     * @returns {readonly any[]} image attachments.
+     */
+    function draftImagesOf(ctx, sessionId) {
+      const conversation = ctx.get('conversation');
+      const shell = inputShellOf(conversation, sessionId);
+      const ids = shell?.state?.getSnapshot?.().attachmentIds;
+      if (!Array.isArray(ids) || typeof conversation?.resolveDraftAttachments !== 'function') return [];
+      let resolved;
+      try {
+        resolved = conversation.resolveDraftAttachments(ids);
+      } catch {
+        return [];
+      }
+      return Array.isArray(resolved)
+        ? resolved.filter((attachment) => attachment && attachment.kind === 'image' && attachment.file)
+        : [];
+    }
+
+    /**
+     * @param {string} source - thumbnail URL.
+     * @returns {Promise<any|null>} edit target rebuilt from the thumbnail's own bytes.
+     */
+    async function resolveByBytes(source) {
+      try {
+        const response = await fetch(source);
+        if (!response.ok) return null;
+        const blob = await response.blob();
+        const type = blob.type || 'image/png';
+        if (!/^image\//.test(type)) return null;
+        const stamp = Date.now();
+        return { file: new File([blob], `pasted-image-${stamp}.png`, { type }), replaceId: null };
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * @param {Element} image - thumbnail image element.
+     * @returns {boolean} whether this image is a composer draft image.
+     */
+    function isDraftImage(image) {
+      return image.closest('[data-composer-card], [data-conversation-region="composer"]') !== null;
+    }
+
+    // ---- hover affordance over a draft image ----------------------------------------------
+
+    let hoverSpot = null;
+    const hoverListeners = new Set();
+    /** @param {any} next - hovered thumbnail geometry. */
+    function setHoverSpot(next) {
+      hoverSpot = next;
+      for (const listener of hoverListeners) listener();
+    }
+    const subscribeHover = (listener) => {
+      hoverListeners.add(listener);
+      return () => { hoverListeners.delete(listener); };
+    };
+    const readHover = () => hoverSpot;
+
+    /** Floating ✎ control shown over a hovered draft image. */
+    function HoverBadge() {
+      const spot = React.useSyncExternalStore(subscribeHover, readHover, readHover);
+      if (spot === null) return null;
+      return h('button', {
+        type: 'button',
+        'aria-label': '標註這張圖片',
+        title: '標註這張圖片',
+        style: {
+          position: 'fixed',
+          left: `${spot.left}px`,
+          top: `${spot.top}px`,
+          width: '30px',
+          height: '30px',
+          zIndex: 2147482000,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 0,
+          border: 0,
+          borderRadius: '15px',
+          cursor: 'pointer',
+          color: '#fff',
+          fontSize: '15px',
+          lineHeight: 1,
+          background: 'rgba(0,0,0,.62)',
+          boxShadow: '0 2px 8px rgba(0,0,0,.35)',
+        },
+        onPointerEnter: () => { if (hoverTimer !== null) clearTimeout(hoverTimer); },
+        onPointerLeave: () => scheduleHoverClear(),
+        onClick: (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setHoverSpot(null);
+          openFromSource(spot.source, pluginCtx);
+        },
+      }, '✎');
+    }
+
+    let hoverTimer = null;
+    /** @returns {void} nothing; clears the badge shortly after the pointer leaves. */
+    function scheduleHoverClear() {
+      if (hoverTimer !== null) clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(() => {
+        hoverTimer = null;
+        setHoverSpot(null);
+      }, 260);
+    }
+
+    /**
+     * Open the editor for one thumbnail URL, resolving its bytes first.
+     * @param {string} source - thumbnail URL.
+     * @param {any} ctx - client plugin context.
+     * @returns {void} nothing.
+     */
+    function openFromSource(source, ctx) {
+      const sessionId = currentSessionId(ctx);
+      if (sessionId === null) return;
+      const match = draftImagesOf(ctx, sessionId).find((attachment) => attachment.previewUrl === source);
+      if (match !== undefined) {
+        pendingEdit = { file: match.file, replaceId: match.id, sessionId, actions: null };
+        setOpen(true);
+        return;
+      }
+      resolveByBytes(source).then((target) => {
+        if (target === null) return;
+        pendingEdit = { file: target.file, replaceId: null, sessionId, actions: null };
+        setOpen(true);
+      });
+    }
+
+    /**
+     * @param {any} actions - input actions carrying `addAttachments`.
+     * @param {readonly string[]} ids - staged draft attachment ids.
+     * @returns {Promise<boolean>} whether the ids were accepted.
+     */
+    async function addWithRetry(actions, ids) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          if (actions.addAttachments(ids) !== false) return true;
+        } catch {
+          // Keep retrying while the input phase settles.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+      return false;
+    }
+
+    /**
+     * Attach the annotated PNG as a new draft image.
+     * @param {string} sessionId - Session identity.
+     * @param {File} file - annotated image.
+     * @param {any} fallbackActions - input actions of the rendered composer.
+     * @returns {Promise<{result: string, ids: readonly string[]}>} outcome and staged ids.
+     */
+    async function attachImage(sessionId, file, fallbackActions) {
+      const conversation = pluginCtx.get('conversation');
+      if (!conversation || typeof conversation.createDrafts !== 'function') return { result: 'no-conversation', ids: [] };
+      const shell = inputShellOf(conversation, sessionId);
+      const actions = (shell && typeof shell.addAttachments === 'function' ? shell : null)
+        || (fallbackActions && typeof fallbackActions.addAttachments === 'function' ? fallbackActions : null);
+      if (actions === null) return { result: 'no-composer', ids: [] };
+      let drafts;
+      try {
+        drafts = conversation.createDrafts(sessionId, [file], true);
+      } catch {
+        return { result: 'failed', ids: [] };
+      }
+      if (!Array.isArray(drafts) || drafts.length === 0) return { result: 'failed', ids: [] };
+      const ids = drafts.map((draft) => draft && draft.id).filter(Boolean);
+      if (await addWithRetry(actions, ids)) return { result: 'ok', ids };
+      try {
+        conversation.releaseDraftAttachments(drafts);
+      } catch {
+        // Releasing a refused draft is best effort.
+      }
+      return { result: 'locked', ids: [] };
+    }
+
+    /** Public input actions of the composer on screen, latched from a session-scope slot. */
+    let latchedInputActions = null;
+    /** Whether the latched Session is running (so a submit should steer, not queue). */
+    let latchedRunning = false;
+    /** Agent-team projection of the composer on screen, latched the same way. */
+    let latchedTeam = null;
+    const teamListeners = new Set();
+    /** @param {any} next - latched teamwork state. */
+    function setLatchedTeam(next) {
+      latchedTeam = next;
+      for (const listener of teamListeners) listener();
+    }
+    const subscribeTeam = (listener) => {
+      teamListeners.add(listener);
+      return () => { teamListeners.delete(listener); };
+    };
+    const readTeam = () => latchedTeam;
+    /** @returns {any} the latched actions, or null. */
+    function latchedActions() {
+      return latchedInputActions;
+    }
+
+    // ---- teamwork default-on ------------------------------------------------------------
+    //
+    // Team mode is a per-Session selection and new Sessions default to off. When the
+    // "默认开启智能体团队协作" setting is on, this plugin turns it on as soon as a Session
+    // shows up — unless the user turned it off on purpose in this browser, which is
+    // remembered per Session so the default never fights an explicit choice.
+
+    /** @param {string} sessionId - Session identity. @returns {string} the opt-out storage key. */
+    function teamOptOutKey(sessionId) {
+      return `dsh-slick:team-off:${sessionId}`;
+    }
+
+    /** @param {string} sessionId - Session identity. @returns {boolean} whether the user opted out. */
+    function teamOptedOut(sessionId) {
+      try {
+        return window.localStorage.getItem(teamOptOutKey(sessionId)) === '1';
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * @param {string} sessionId - Session identity.
+     * @param {boolean} enabled - the user's explicit choice.
+     * @returns {void} nothing.
+     */
+    function rememberTeamChoice(sessionId, enabled) {
+      try {
+        if (enabled) window.localStorage.removeItem(teamOptOutKey(sessionId));
+        else window.localStorage.setItem(teamOptOutKey(sessionId), '1');
+      } catch {
+        // A missing marker only means the default applies again next load.
+      }
+    }
+
+    /** Sessions already auto-enabled in this page, so a refused write is not retried forever. */
+    const teamAutoTried = new Set();
+
+    /**
+     * Turn teamwork on for one Session unless the user opted out.
+     * @param {string} sessionId - Session identity.
+     * @returns {void} nothing.
+     */
+    function ensureTeamOn(sessionId) {
+      if (teamAutoTried.has(sessionId) || teamOptedOut(sessionId)) return;
+      teamAutoTried.add(sessionId);
+      const remote = pluginCtx?.get('remote.agentTeams') ?? pluginCtx?.get('remote')?.agentTeams;
+      if (!remote || typeof remote.setEnabled !== 'function') return;
+      try {
+        Promise.resolve(remote.setEnabled(sessionId, true)).catch(() => {});
+      } catch {
+        // Leaving the mode as it was is the safe failure.
+      }
+    }
+
+    /**
+     * Write teamwork on/off for a Session through the shipped remote.
+     * @param {string} sessionId - Session identity.
+     * @param {boolean} enabled - desired state.
+     * @returns {void} nothing.
+     */
+    function setTeamEnabled(sessionId, enabled) {
+      const remote = pluginCtx?.get('remote.agentTeams') ?? pluginCtx?.get('remote')?.agentTeams;
+      if (!remote || typeof remote.setEnabled !== 'function') return;
+      try {
+        Promise.resolve(remote.setEnabled(sessionId, enabled)).catch(() => {});
+      } catch {
+        // Leaving the mode as it was is the safe failure.
+      }
+    }
+
+    /**
+     * Hand the current "run N subagents" requirement to the host half, which folds it into the
+     * system prompt. The composer draft is never touched, so nothing appears in the user's text.
+     * @param {boolean} enabled - whether team mode plus the force toggle are both on.
+     * @returns {void} nothing.
+     */
+    function publishSubagentRequirement(enabled) {
+      const host = subagentForm();
+      let count = null;
+      if (host !== null && typeof host.getSnapshot === 'function') {
+        try {
+          const value = host.getSnapshot().value?.maxActiveSubagents;
+          if (typeof value === 'number') count = value;
+        } catch {
+          count = null;
+        }
+      }
+      // The "off" stop means no delegation at all, so nothing is required.
+      const offValue = stopsOf(readSettings())[0]?.value;
+      const wanted = enabled && count !== null && count !== offValue && count > 0 ? count : 0;
+      try {
+        fetch('/dsh-slick/subagent-requirement', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          cache: 'no-store',
+          body: JSON.stringify({ count: wanted }),
+        }).catch(() => {});
+      } catch {
+        // Without the host endpoint the requirement simply does not apply.
+      }
+    }
+
+    /**
+     * Team mode follows the two capacity sliders: turning teamwork on lifts each slider to Medium
+     * only while it sits BELOW Medium (a value already at or above Medium is the user's choice and
+     * is left alone), and dropping either one to off/Low turns teamwork off again.
+     * @param {string} reason - 'team-on' | 'cap-low'.
+     * @returns {void} nothing.
+     */
+    function syncCapacityWithTeam(reason) {
+      const sessionId = latchedTeam?.sessionId ?? currentSessionId(pluginCtx);
+      if (typeof sessionId !== 'string' || sessionId === '') return;
+      const values = readSettings();
+      const host = subagentForm();
+      if (reason === 'team-on') {
+        if (host === null || typeof host.getSnapshot !== 'function' || typeof host.set !== 'function') return;
+        let section;
+        try {
+          section = host.getSnapshot().value;
+        } catch {
+          return;
+        }
+        const stops = stopsOf(values);
+        const medium = stops.find((stop) => stop.label === 'Medium');
+        const current = section?.maxActiveSubagents;
+        if (medium !== undefined && !(typeof current === 'number' && current >= medium.value)) {
+          try {
+            Promise.resolve(host.set('maxActiveSubagents', medium.value)).catch(() => {});
+          } catch {
+            // A refused write leaves the previous value in place.
+          }
+        }
+        return;
+      }
+      // A slider landed on off or Low: teamwork must not stay on.
+      if (latchedTeam?.enabled === true) setTeamEnabled(sessionId, false);
+    }
+
+    /** Invisible session-scope entry that keeps the composer's actions and teamwork state reachable. */
+    function InputActionsLatch(props) {
+      const team = typeof props.useProjection === 'function' ? props.useProjection('agentTeam') : undefined;
+      const running = typeof props.useSession === 'function'
+        ? props.useSession((snapshot) => snapshot.running === true)
+        : false;
+      React.useEffect(() => {
+        latchedInputActions = props.inputActions ?? null;
+        return () => {
+          if (latchedInputActions === props.inputActions) latchedInputActions = null;
+        };
+      }, [props.inputActions]);
+      React.useEffect(() => {
+        latchedRunning = running === true;
+      }, [running]);
+      React.useEffect(() => {
+        setLatchedTeam(team === undefined
+          ? null
+          : { enabled: team.enabled === true, sessionId: props.sessionId ?? null });
+        return () => { setLatchedTeam(null); };
+      }, [team, props.sessionId]);
+      // Team on => both capacity sliders jump to Medium.
+      React.useEffect(() => {
+        if (team === undefined || team === null || team.enabled !== true) return;
+        const sessionId = props.sessionId;
+        if (typeof sessionId !== 'string' || sessionId === '') return;
+        syncCapacityWithTeam('team-on');
+      }, [team?.enabled, props.sessionId]);
+      // Push the "must run N subagents" requirement to the host, which folds it into the system
+      // prompt — so nothing is ever written into the user's visible draft.
+      React.useEffect(() => {
+        const enabled = settings.forceSubagentCount === true && team?.enabled === true;
+        publishSubagentRequirement(enabled);
+      }, [team?.enabled, settings.forceSubagentCount]);
+      return null;
+    }
+
+    /**
+     * Wait until the staged attachment ids are published by the composer.
+     * @param {any} shell - session input shell.
+     * @param {readonly string[]} ids - ids just added.
+     * @returns {Promise<boolean>} whether they appeared (or the wait timed out).
+     */
+    async function waitForAttachments(shell, ids) {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+          const state = shell.state?.getSnapshot?.();
+          const current = Array.isArray(state?.attachmentIds) ? state.attachmentIds : [];
+          if (ids.every((id) => current.includes(id))) return true;
+        } catch {
+          // Keep waiting while the store settles.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+      return false;
+    }
+
+    /**
+     * Submit the composer's current draft, delivering immediately instead of waiting.
+     * @param {string} sessionId - Session identity.
+     * @returns {Promise<'sent'|'has-text'|'busy'|'unavailable'>} outcome.
+     */
+    async function submitDraft(sessionId) {
+      const conversation = pluginCtx.get('conversation');
+      const shell = inputShellOf(conversation, sessionId);
+      let state;
+      try {
+        state = shell?.state?.getSnapshot?.();
+      } catch {
+        state = undefined;
+      }
+      if (state !== undefined && typeof state.draft === 'string' && state.draft.trim() !== '') return 'has-text';
+      if (state !== undefined && state.phase !== 'plain' && state.phase !== 'claimed') return 'busy';
+      // A running Session takes the draft immediately as a steering message instead of queueing it.
+      const mode = latchedRunning ? 'steer' : 'queue';
+      if (shell !== null && typeof shell.submit === 'function') {
+        try {
+          shell.submit(mode, 'click');
+          return 'sent';
+        } catch {
+          // Fall through to the public input actions.
+        }
+      }
+      const actions = latchedActions();
+      if (actions !== null && typeof actions.submit === 'function') {
+        try {
+          actions.submit();
+          return 'sent';
+        } catch {
+          return 'unavailable';
+        }
+      }
+      return 'unavailable';
+    }
+
+    /** The annotation editor: the draft image, canvas marks, and Save. */
+    function Editor(props) {
+      const sessionId = props.sessionId;
+      const initialFile = props.initialFile;
+      const replaceId = props.replaceId;
+      const actions = props.actions;
+      const canvasRef = React.useRef(null);
+      const stageRef = React.useRef(null);
+      const imageRef = React.useRef(null);
+      const strokesRef = React.useRef([]);
+      const redoRef = React.useRef([]);
+      const activeRef = React.useRef(null);
+      const fileRef = React.useRef(null);
+      const [tool, setTool] = React.useState('pen');
+      const [color, setColor] = React.useState(COLORS[0]);
+      const [width, setWidth] = React.useState(WIDTH_DEFAULT);
+      const [hasImage, setHasImage] = React.useState(initialFile !== null && initialFile !== undefined);
+      /** Wheel zoom, 1 = fit-to-stage. */
+      const [zoom, setZoom] = React.useState(1);
+      const zoomRef = React.useRef(1);
+      const [version, setVersion] = React.useState(0);
+      const [busy, setBusy] = React.useState(false);
+      const [error, setError] = React.useState(null);
+      /** Index of the selected mark, or null. */
+      const [selected, setSelected] = React.useState(null);
+      /** Live drag state: {kind: 'move'|'handle', handle, start, box}. */
+      const dragRef = React.useRef(null);
+
+      const redraw = React.useCallback(() => {
+        const canvas = canvasRef.current;
+        if (canvas === null) return;
+        const surface = canvas.getContext('2d');
+        if (surface === null) return;
+        surface.clearRect(0, 0, canvas.width, canvas.height);
+        if (imageRef.current !== null) surface.drawImage(imageRef.current, 0, 0);
+        for (const stroke of strokesRef.current) paintStroke(surface, stroke);
+        if (activeRef.current !== null) paintStroke(surface, activeRef.current);
+        // Selection chrome is drawn on the canvas so it never lands in the exported PNG: the export
+        // re-renders without it (see save()).
+        const stroke = selected === null ? undefined : strokesRef.current[selected];
+        if (stroke !== undefined) drawSelection(surface, stroke, canvas.width);
+      }, [selected]);
+
+      /** Size the canvas so the whole image fills the stage while keeping its ratio. */
+      const fit = React.useCallback(() => {
+        const canvas = canvasRef.current;
+        const stage = stageRef.current;
+        const image = imageRef.current;
+        if (canvas === null || stage === null || image === null) return;
+        const ratio = image.naturalWidth / Math.max(1, image.naturalHeight);
+        const availableWidth = Math.max(160, stage.clientWidth - 4);
+        const availableHeight = Math.max(160, window.innerHeight * 0.68);
+        let displayWidth = availableWidth;
+        let displayHeight = displayWidth / ratio;
+        if (displayHeight > availableHeight) {
+          displayHeight = availableHeight;
+          displayWidth = displayHeight * ratio;
+        }
+        const factor = zoomRef.current;
+        canvas.style.width = `${Math.round(displayWidth * factor)}px`;
+        canvas.style.height = `${Math.round(displayHeight * factor)}px`;
+      }, []);
+      // Keep the ref in step so the memoised fit() always reads the latest zoom.
+      React.useEffect(() => { zoomRef.current = zoom; fit(); }, [zoom, fit]);
+      // Non-passive wheel listener: React's own onWheel may be passive, which would block
+      // preventDefault and let the page scroll instead of zooming the image.
+      React.useEffect(() => {
+        const stage = stageRef.current;
+        if (stage === null) return undefined;
+        const onWheel = (event) => {
+          if (!hasImage) return;
+          event.preventDefault();
+          const step = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+          setZoom((current) => Math.max(1, Math.min(8, current * step)));
+        };
+        stage.addEventListener('wheel', onWheel, { passive: false });
+        return () => stage.removeEventListener('wheel', onWheel);
+      }, [hasImage]);
+
+      const adopt = React.useCallback((file) => {
+        if (!file || !/^image\//.test(file.type || '')) {
+          setError('只支援圖片檔');
+          return;
+        }
+        decode(file).then((image) => {
+          const canvas = canvasRef.current;
+          imageRef.current = image;
+          strokesRef.current = [];
+          redoRef.current = [];
+          if (canvas !== null) {
+            canvas.width = image.naturalWidth;
+            canvas.height = image.naturalHeight;
+          }
+          setHasImage(true);
+          setError(null);
+          setVersion((value) => value + 1);
+          fit();
+          redraw();
+        }).catch(() => setError('這張圖片無法解碼'));
+      }, [fit, redraw]);
+
+      React.useEffect(() => { redraw(); }, [version, redraw]);
+
+      React.useEffect(() => {
+        if (initialFile !== null && initialFile !== undefined) adopt(initialFile);
+        const onResize = () => fit();
+        window.addEventListener('resize', onResize);
+        return () => window.removeEventListener('resize', onResize);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+
+      const close = React.useCallback(() => setOpen(false), []);
+
+      const undo = React.useCallback(() => {
+        const stroke = strokesRef.current.pop();
+        if (stroke === undefined) return;
+        redoRef.current.push(stroke);
+        setVersion((value) => value + 1);
+      }, []);
+      const redo = React.useCallback(() => {
+        const stroke = redoRef.current.pop();
+        if (stroke === undefined) return;
+        strokesRef.current.push(stroke);
+        setVersion((value) => value + 1);
+      }, []);
+      const clear = React.useCallback(() => {
+        strokesRef.current = [];
+        redoRef.current = [];
+        setVersion((value) => value + 1);
+      }, []);
+
+      const pointOf = (event) => {
+        const canvas = canvasRef.current;
+        if (canvas === null) return { x: 0, y: 0 };
+        const rect = canvas.getBoundingClientRect();
+        return {
+          x: (event.clientX - rect.left) * (canvas.width / Math.max(1, rect.width)),
+          y: (event.clientY - rect.top) * (canvas.height / Math.max(1, rect.height)),
+        };
+      };
+
+      /** @param {{x: number, y: number}} point - eraser position. */
+      const eraseAt = (point) => {
+        const canvas = canvasRef.current;
+        const reach = canvas === null ? 24 : canvas.width * ERASER_RATIO;
+        const before = strokesRef.current.length;
+        strokesRef.current = strokesRef.current.filter((stroke) => !strokeHit(stroke, point, reach));
+        if (strokesRef.current.length !== before) {
+          redoRef.current = [];
+          setVersion((value) => value + 1);
+        }
+      };
+
+      const onPointerDown = (event) => {
+        if (!hasImage) return;
+        if (event.currentTarget.setPointerCapture) event.currentTarget.setPointerCapture(event.pointerId);
+        const point = pointOf(event);
+        const canvas = canvasRef.current;
+        const grab = canvas === null ? 12 : Math.max(10, canvas.width / 90);
+
+        // Selection takes priority: grab a handle of the selected mark, or a mark under the pointer.
+        const current = selected === null ? undefined : strokesRef.current[selected];
+        if (current !== undefined) {
+          const handle = handleAt(boundsOf(current), point, grab);
+          if (handle !== null) {
+            dragRef.current = { kind: 'handle', handle, box: boundsOf(current), start: point };
+            return;
+          }
+        }
+        if (tool !== 'eraser') {
+          const hitIndex = [...strokesRef.current].reverse()
+            .findIndex((stroke) => strokeHit(stroke, point, grab / 2));
+          if (hitIndex !== -1) {
+            const index = strokesRef.current.length - 1 - hitIndex;
+            setSelected(index);
+            dragRef.current = { kind: 'move', box: boundsOf(strokesRef.current[index]), start: point };
+            setVersion((value) => value + 1);
+            return;
+          }
+        }
+        // Nothing selected: a fresh drag starts a new mark and clears the selection.
+        if (selected !== null) {
+          setSelected(null);
+          setVersion((value) => value + 1);
+        }
+        if (tool === 'eraser') {
+          eraseAt(point);
+          return;
+        }
+        activeRef.current = { tool, color, width, points: [point] };
+        redraw();
+      };
+      const onPointerMove = (event) => {
+        const point = pointOf(event);
+        const drag = dragRef.current;
+        if (drag !== null) {
+          const stroke = strokesRef.current[selected ?? -1];
+          if (stroke === undefined) return;
+          if (drag.kind === 'handle') {
+            transformStroke(stroke, drag.box, resizeBox(drag.box, drag.handle, point));
+          } else {
+            const dx = point.x - drag.start.x;
+            const dy = point.y - drag.start.y;
+            transformStroke(stroke, drag.box, { ...drag.box, x: drag.box.x + dx, y: drag.box.y + dy });
+            drag.start = point;
+          }
+          drag.box = boundsOf(stroke);
+          redraw();
+          return;
+        }
+        if (tool === 'eraser') {
+          if (event.buttons === 1) eraseAt(point);
+          return;
+        }
+        if (activeRef.current === null) return;
+        const points = activeRef.current.points;
+        if (tool === 'pen') points.push(point);
+        else points[1] = point;
+        redraw();
+      };
+      const onPointerUp = () => {
+        if (dragRef.current !== null) {
+          dragRef.current = null;
+          setVersion((value) => value + 1);
+          return;
+        }
+        if (activeRef.current === null) return;
+        strokesRef.current.push(activeRef.current);
+        activeRef.current = null;
+        redoRef.current = [];
+        setVersion((value) => value + 1);
+      };
+
+      const save = () => {
+        const canvas = canvasRef.current;
+        if (canvas === null || !hasImage || busy) return;
+        setBusy(true);
+        setError(null);
+        // Export a clean copy: the on-screen canvas carries the selection outline, which must not
+        // end up baked into the saved image.
+        const clean = document.createElement('canvas');
+        clean.width = canvas.width;
+        clean.height = canvas.height;
+        const surface = clean.getContext('2d');
+        if (surface === null) {
+          setBusy(false);
+          setError('匯出失敗');
+          return;
+        }
+        if (imageRef.current !== null) surface.drawImage(imageRef.current, 0, 0);
+        for (const stroke of strokesRef.current) paintStroke(surface, stroke);
+        clean.toBlob((blob) => {
+          if (blob === null) {
+            setBusy(false);
+            setError('匯出失敗');
+            return;
+          }
+          const file = new File([blob], fileName(new Date()), { type: 'image/png' });
+          const target = sessionId || currentSessionId(pluginCtx);
+          if (target === null) {
+            setBusy(false);
+            setError('沒有可用的對話');
+            return;
+          }
+          attachImage(target, file, actions).then(async (attached) => {
+            if (attached.result !== 'ok') {
+              setBusy(false);
+              setError(`附加失敗（${attached.result}），請稍後再試`);
+              return;
+            }
+            if (replaceId && actions && typeof actions.removeAttachment === 'function') {
+              try {
+                actions.removeAttachment(replaceId);
+              } catch {
+                // Keeping the original is the safe failure.
+              }
+            }
+            const shell = inputShellOf(pluginCtx.get('conversation'), target);
+            if (shell !== null) await waitForAttachments(shell, attached.ids);
+            setBusy(false);
+            close();
+            if (!settings.autoSendImage) {
+              showNotice('已存成標註圖片，按送出即發送');
+              return;
+            }
+            // Send immediately, but never swallow text the user is composing.
+            const outcome = await submitDraft(target);
+            if (outcome === 'sent') showNotice('已發送標註後的圖片');
+            else if (outcome === 'has-text') showNotice('已附加標註圖片；輸入框有文字，按送出即一併發送');
+            else if (outcome === 'busy') showNotice('已附加標註圖片；目前正在回覆中，稍後會自動送出');
+            else showNotice('已附加標註圖片，請按送出');
+          }).catch(() => {
+            setBusy(false);
+            setError('附加失敗，請稍後再試');
+          });
+        }, 'image/png');
+      };
+
+      React.useEffect(() => {
+        /**
+         * Esc closes, Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z and Ctrl/Cmd+Y redo, and Ctrl/Cmd+S saves
+         * and attaches — the same action as the 儲存並附加 button.
+         */
+        const onKey = (event) => {
+          if (!(event.ctrlKey || event.metaKey) || event.altKey) {
+            if (event.key === 'Escape') close();
+            return;
+          }
+          const key = event.key.toLowerCase();
+          if (key === 'z') {
+            event.preventDefault();
+            if (event.shiftKey) redo();
+            else undo();
+          } else if (key === 'y') {
+            event.preventDefault();
+            redo();
+          } else if (key === 's') {
+            event.preventDefault();
+            event.stopPropagation();
+            save();
+          }
+        };
+        document.addEventListener('keydown', onKey);
+        return () => document.removeEventListener('keydown', onKey);
+      }, [close, redo, undo, save]);
+
+      /** Icon paths for each drawing tool, drawn at 16×16 inside a 24×24 box. */
+      const TOOL_ICONS = {
+        pen: 'M4 20c2.5-.6 4.2-1.6 5.8-3.2l8-8a2.1 2.1 0 0 0-3-3l-8 8C5.2 15.4 4.2 17.2 4 20Z',
+        rect: 'M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5Z',
+        circle: 'M12 19.5a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15Z',
+        line: 'M5 19 19 5',
+        arrow: 'M5 19 19 5m0 0h-7m7 0v7',
+        eraser: 'M8 20h11M6.5 17.5 16 8a2.1 2.1 0 0 1 3 3l-6.5 6.5H9l-2.5-2.5-1 1.5Z',
+      };
+      const toolButton = (id, label) => h('button', {
+        key: id, type: 'button', className: 'ia-tool', 'data-on': tool === id ? '1' : '0',
+        title: label, 'aria-label': label, onClick: () => setTool(id),
+      }, h('svg', {
+        viewBox: '0 0 24 24', width: 16, height: 16, fill: 'none', 'aria-hidden': true,
+      }, h('path', {
+        d: TOOL_ICONS[id],
+        stroke: 'currentColor',
+        strokeWidth: 1.7,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+      })));
+
+      const header = h('div', { className: 'ia-bar', key: 'header' },
+        h('span', { className: 'ia-bar-title' }, '標註圖片'),
+        h('span', { className: 'ia-hint' }, '畫好按「儲存並附加」取代原本那張圖 · Ctrl+Z 復原 · Esc 關閉'),
+        h('span', { className: 'ia-grow' }),
+        h('button', {
+          type: 'button', className: 'ia-close', onClick: close, title: '關閉（Esc）', 'aria-label': '關閉',
+        }, h('svg', {
+          viewBox: '0 0 24 24', width: 13, height: 13, fill: 'none', 'aria-hidden': true,
+        }, h('path', {
+          d: 'M6 6l12 12M18 6 6 18',
+          stroke: 'currentColor',
+          strokeWidth: 2,
+          strokeLinecap: 'round',
+        }))));
+
+      // One continuous row: tools, colours, a continuous width slider, then the actions.
+      const widthText = Number.isInteger(width) ? String(width) : width.toFixed(1);
+      const widthControl = h('span', { className: 'ia-width', key: 'width' },
+        h('input', {
+          key: 'range', type: 'range', className: 'ia-range',
+          min: WIDTH_MIN, max: WIDTH_MAX, step: 0.5, value: width, 'aria-label': '筆畫粗細',
+          onChange: (event) => setWidth(Number(event.target.value)),
+        }),
+        h('span', { className: 'ia-width-value', key: 'value' }, widthText));
+
+      const controls = h('div', { className: 'ia-bar', key: 'controls' },
+        toolButton('pen', '筆'),
+        toolButton('rect', '方框'),
+        toolButton('circle', '畫圈'),
+        toolButton('line', '直線'),
+        toolButton('arrow', '箭頭'),
+        toolButton('eraser', '橡皮擦'),
+        h('span', { className: 'ia-div', key: 'div-tools' }),
+        ...COLORS.map((value) => h('button', {
+          key: value, type: 'button', className: 'ia-swatch', 'data-on': color === value ? '1' : '0',
+          style: { background: value }, 'aria-label': `顏色 ${value}`, onClick: () => setColor(value),
+        })),
+        h('span', { className: 'ia-div', key: 'div-color' }),
+        widthControl,
+        h('span', { className: 'ia-div', key: 'div-width' }),
+        // Live ink samples: dot = pen, outline = box, ring = circle, all in the current colour and
+        // stroke width. They replace the old text labels on the toolbar.
+        h('span', { className: 'ia-div', key: 'div-sample' }),
+        h('button', { key: 'undo', type: 'button', className: 'ia-act', onClick: undo, title: '復原（Ctrl+Z）' }, '復原'),
+        h('button', { key: 'clear', type: 'button', className: 'ia-act', onClick: clear }, '清除'),
+        h('button', { key: 'save', type: 'button', className: 'ia-act', onClick: save, disabled: !hasImage || busy },
+          busy ? '儲存中…' : '儲存並附加'));
+
+      const stage = h('div', {
+        className: 'ia-stage',
+        ref: stageRef,
+        key: 'stage',
+        'data-zoomed': zoom > 1 ? '1' : '0',
+      },
+        hasImage
+          ? h('canvas', {
+            key: 'canvas', ref: canvasRef, className: 'ia-canvas', 'data-tool': tool,
+            onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
+            onPointerLeave: (event) => { if (activeRef.current !== null) onPointerUp(event); },
+          })
+          : h('div', { className: 'ia-empty', key: 'empty' },
+            h('strong', null, '沒有可編輯的圖片'),
+            h('span', null, '先關閉，把圖片貼進輸入框，再點那張圖片的 ✎。'),
+            h('button', { type: 'button', className: 'ia-pick', onClick: () => fileRef.current.click() }, '或選擇一張圖片'),
+            h('input', {
+              ref: fileRef, type: 'file', accept: 'image/*', style: { display: 'none' },
+              onChange: (event) => {
+                const file = event.target.files && event.target.files[0];
+                if (file) adopt(file);
+                event.target.value = '';
+              },
+            })));
+
+      return h('div', {
+        className: 'ia-mask',
+        onPointerDown: (event) => { if (event.target === event.currentTarget) close(); },
+      }, h('div', { className: 'ia-card', role: 'dialog', 'aria-modal': 'true', 'aria-label': '標註圖片' },
+        h('div', { className: 'ia-toolbar' }, header, controls),
+        stage,
+        error === null ? null : h('div', { className: 'ia-error' }, error)));
+    }
+
+    /** Root-scoped overlay entry; renders only while the editor is open. */
+    function EditorOverlay() {
+      const shown = React.useSyncExternalStore(subscribeOpen, readOpen, readOpen);
+      if (!shown) return null;
+      const pending = pendingEdit;
+      return h(Editor, {
+        sessionId: pending === null ? null : pending.sessionId,
+        initialFile: pending === null ? null : pending.file,
+        replaceId: pending === null ? null : pending.replaceId,
+        actions: pending === null ? null : pending.actions,
+      });
+    }
+
+    /**
+     * One draft image: thumbnail opens the editor, ✕ removes it.
+     * @param {any} props - rail item values.
+     * @returns {any} rail item element.
+     */
+    function ImageItem(props) {
+      const attachment = props.attachment;
+      const upload = props.upload;
+      const busy = upload !== undefined && upload.status === 'uploading';
+      const failed = upload !== undefined && upload.status === 'error';
+      return h('div', { className: 'ia-item' },
+        h('button', {
+          type: 'button', className: 'ia-thumb', title: '標註這張圖',
+          'aria-label': `標註 ${attachment.file.name || '圖片'}`,
+          onClick: () => props.onEdit(),
+        }, h('img', { src: attachment.previewUrl, alt: attachment.file.name || '' })),
+        h('span', { className: 'ia-tools' },
+          h('button', {
+            type: 'button', className: 'ia-mini', title: '標註', 'aria-label': '標註', onClick: () => props.onEdit(),
+          }, '✎'),
+          h('button', {
+            type: 'button', className: 'ia-mini', title: '移除', 'aria-label': '移除', onClick: () => props.onRemove(),
+          }, '✕')),
+        busy
+          ? h('span', { className: 'ia-progress' },
+            h('span', {
+              style: upload.total === undefined || upload.total <= 0
+                ? undefined
+                : { width: `${String(Math.min(1, upload.loaded / upload.total) * 100)}%` },
+            }))
+          : null,
+        failed
+          ? h('button', {
+            type: 'button', className: 'ia-mini', style: { left: '3px', right: 'auto', top: '3px', position: 'absolute' },
+            title: '重試上傳', onClick: () => props.onRetry(),
+          }, '↻')
+          : null);
+    }
+
+    /**
+     * One draft file: name, size, upload state, and remove.
+     * @param {any} props - rail item values.
+     * @returns {any} rail item element.
+     */
+    function FileItem(props) {
+      const attachment = props.attachment;
+      const upload = props.upload;
+      const state = upload === undefined || upload.status === 'uploading'
+        ? '上傳中'
+        : upload.status === 'ready' ? '' : '上傳失敗';
+      return h('div', { className: 'ia-item' },
+        h('div', { className: 'ia-file' },
+          h('span', { 'aria-hidden': true }, '📄'),
+          h('span', null,
+            h('span', { className: 'ia-file-name', title: attachment.file.name }, attachment.file.name),
+            h('span', { className: 'ia-file-meta' }, ` ${state}`))),
+        h('span', { className: 'ia-tools' },
+          h('button', {
+            type: 'button', className: 'ia-mini', title: '移除', 'aria-label': '移除', onClick: () => props.onRemove(),
+          }, '✕')));
+    }
+
+    /** The attachment rail that shadows the default one. */
+    function Rail(props) {
+      const attachments = Array.isArray(props.attachments) ? props.attachments : [];
+      const uploads = props.uploads || {};
+      const actions = props.inputActions;
+      const sessionId = props.sessionId || domSessionId();
+
+      React.useEffect(() => {
+        const onDragOver = (event) => {
+          if (!event.dataTransfer) return;
+          if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+          event.preventDefault();
+        };
+        const onDrop = (event) => {
+          if (!event.dataTransfer || event.dataTransfer.files.length === 0) return;
+          event.preventDefault();
+          if (props.canAcceptDrop !== true) return;
+          props.onAddFiles(Array.from(event.dataTransfer.files));
+        };
+        document.addEventListener('dragover', onDragOver);
+        document.addEventListener('drop', onDrop);
+        return () => {
+          document.removeEventListener('dragover', onDragOver);
+          document.removeEventListener('drop', onDrop);
+        };
+      }, [props.canAcceptDrop, props.onAddFiles]);
+
+      if (attachments.length === 0) return null;
+      return h('div', { className: 'ia-rail' }, attachments.map((attachment) => {
+        const upload = uploads[attachment.id];
+        if (attachment.kind === 'file') {
+          return h(FileItem, {
+            key: attachment.id, attachment, upload,
+            onRemove: () => props.onRemoveAttachment(attachment.id),
+          });
+        }
+        return h(ImageItem, {
+          key: attachment.id, attachment, upload,
+          onEdit: () => {
+            pendingEdit = {
+              file: attachment.file,
+              replaceId: attachment.id,
+              sessionId: sessionId === null ? currentSessionId(pluginCtx) : sessionId,
+              actions,
+            };
+            setOpen(true);
+          },
+          onRemove: () => props.onRemoveAttachment(attachment.id),
+          onRetry: () => props.onRetryFile(attachment.id),
+        });
+      }));
+    }
+
+    // ---- paste conversion: table → .xlsx, long text → .txt -------------------------------
+
+    let notice = null;
+    const noticeListeners = new Set();
+    let noticeTimer = null;
+
+    /**
+     * @param {string} text - notice body.
+     * @param {'ok'|'error'} [kind] - severity.
+     * @returns {void} nothing.
+     */
+    function showNotice(text, kind) {
+      if (noticeTimer !== null) clearTimeout(noticeTimer);
+      notice = { text: String(text), kind: kind === 'error' ? 'error' : 'ok' };
+      for (const listener of noticeListeners) listener();
+      noticeTimer = setTimeout(() => {
+        noticeTimer = null;
+        notice = null;
+        for (const listener of noticeListeners) listener();
+      }, 3600);
+    }
+
+    const subscribeNotice = (listener) => {
+      noticeListeners.add(listener);
+      return () => { noticeListeners.delete(listener); };
+    };
+    const readNotice = () => notice;
+
+    // ---- load proof ---------------------------------------------------------------------
+
+    let badge = true;
+    const badgeListeners = new Set();
+    /** @param {boolean} next - whether the load badge is visible. */
+    function setBadge(next) {
+      badge = next;
+      for (const listener of badgeListeners) listener();
+    }
+    const subscribeBadge = (listener) => {
+      badgeListeners.add(listener);
+      return () => { badgeListeners.delete(listener); };
+    };
+    const readBadge = () => badge;
+
+    // ---- restart control ------------------------------------------------------------------
+
+    /** Path of the host endpoint that performs the restart. */
+    const RESTART_ENDPOINT = '/dsh-slick/restart';
+
+    /**
+     * Ask the host to relaunch DSH: close the app, wait three seconds, start it again.
+     * The host answers 202 before it acts, so the click always feels instant.
+     * @returns {void} nothing.
+     */
+    function requestRestart() {
+      showNotice('正在重啟 DSH…');
+      let request;
+      try {
+        request = fetch(RESTART_ENDPOINT, { method: 'POST', cache: 'no-store' });
+      } catch {
+        showNotice('重啟失敗：無法連線到本機服務', 'error');
+        return;
+      }
+      Promise.resolve(request).then((response) => {
+        if (response.ok !== true) showNotice(`重啟失敗（HTTP ${String(response.status)}）`, 'error');
+      }, () => showNotice('重啟失敗：無法連線到本機服務', 'error'));
+    }
+
+    let restartArmed = false;
+    const restartListeners = new Set();
+    /** @param {boolean} next - whether the host answered the availability probe. */
+    function setRestartArmed(next) {
+      if (restartArmed === next) return;
+      restartArmed = next;
+      for (const listener of restartListeners) listener();
+    }
+    const subscribeRestart = (listener) => {
+      restartListeners.add(listener);
+      return () => { restartListeners.delete(listener); };
+    };
+    const readRestart = () => restartArmed;
+
+    /** Small restart button that sits next to the build badge. */
+    function RestartButton() {
+      const armed = React.useSyncExternalStore(subscribeRestart, readRestart, readRestart);
+      const [busy, setBusy] = React.useState(false);
+      React.useEffect(() => {
+        let disposed = false;
+        const probe = () => {
+          fetch(RESTART_ENDPOINT, { method: 'GET', cache: 'no-store' }).then((response) => {
+            if (disposed) return;
+            setRestartArmed(response.ok === true);
+          }, () => {
+            if (!disposed) setRestartArmed(false);
+          });
+        };
+        probe();
+        return () => { disposed = true; };
+      }, []);
+      if (!armed) return null;
+      return h('button', {
+        type: 'button',
+        className: 'ct-restart',
+        title: '重啟 DSH（立即重新開啟）',
+        'aria-label': '重啟 DSH',
+        disabled: busy,
+        onClick: () => {
+          if (busy) return;
+          setBusy(true);
+          requestRestart();
+          setTimeout(() => setBusy(false), 2500);
+        },
+      }, h('svg', { viewBox: '0 0 24 24', width: 14, height: 14, fill: 'none', 'aria-hidden': true },
+        h('path', {
+          d: 'M4 12a8 8 0 1 1 2.6 5.9M4 12V6m0 6h6',
+          stroke: 'currentColor',
+          strokeWidth: 2,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        })));
+    }
+
+    /** Short-lived chip naming the loaded build; disappears on its own. */
+    function LoadBadge() {
+      const shown = React.useSyncExternalStore(subscribeBadge, readBadge, readBadge);
+      React.useEffect(() => {
+        const timer = setTimeout(() => setBadge(false), 14000);
+        return () => clearTimeout(timer);
+      }, []);
+      if (!shown) return null;
+      return h('div', {
+        style: {
+          position: 'fixed',
+          right: '14px',
+          top: '10px',
+          zIndex: 2147482000,
+          padding: '2px 8px',
+          borderRadius: '10px',
+          fontSize: '11px',
+          pointerEvents: 'none',
+          opacity: '.8',
+          color: '#f5f5f5',
+          background: 'rgba(28,28,30,.8)',
+        },
+      }, BUILD);
+    }
+
+    /** Bottom-center status chip for paste results. */
+    function NoticeTip() {
+      const current = React.useSyncExternalStore(subscribeNotice, readNotice, readNotice);
+      if (current === null) return null;
+      return h('div', {
+        role: 'status',
+        'aria-live': 'polite',
+        style: {
+          position: 'fixed',
+          left: '50%',
+          bottom: '96px',
+          transform: 'translateX(-50%)',
+          zIndex: 2147482000,
+          padding: '4px 12px',
+          borderRadius: '8px',
+          fontSize: '12px',
+          maxWidth: '80vw',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          pointerEvents: 'none',
+          color: current.kind === 'error' ? '#ff8a80' : '#f5f5f5',
+          background: 'rgba(28,28,30,.82)',
+        },
+      }, current.text);
+    }
+
+    /**
+     * @param {Element} target - paste target.
+     * @returns {boolean} whether the target is the composer's draft editor.
+     */
+    function isComposerEditor(target) {
+      const editable = target.tagName === 'TEXTAREA' || target.isContentEditable === true;
+      if (!editable) return false;
+      if (target.hasAttribute('data-phase')) return true;
+      return target.closest('[data-input-scroll]') !== null;
+    }
+
+    /**
+     * Put the original text back when the conversion could not happen.
+     * @param {Element} target - composer editor.
+     * @param {string} text - original clipboard text.
+     * @returns {boolean} whether the text reached the editor.
+     */
+    function insertRawText(target, text) {
+      try {
+        if (target.isContentEditable === true && document.execCommand('insertText', false, text)) return true;
+      } catch {
+        // Fall through to the manual range insertion.
+      }
+      const selection = window.getSelection();
+      if (selection === null || selection.rangeCount === 0) return false;
+      const range = selection.getRangeAt(0);
+      if (!target.contains(range.commonAncestorContainer)) return false;
+      range.deleteContents();
+      const node = document.createTextNode(text);
+      range.insertNode(node);
+      range.setStartAfter(node);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      target.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      return true;
+    }
+
+    /**
+     * @param {Date} date - paste time.
+     * @returns {string} `YYYYMMDD-HHmmss`.
+     */
+    function fileStamp(date) {
+      const pad = (value) => String(value).padStart(2, '0');
+      return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}`
+        + `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+    }
+
+
+
+    /** @type {Map<string, any[]>} lazily built particle fields per preset id. */
+    const particleCache = new Map();
+    
+
+    
+
+
+
+    
+
+    
+
+    /**
+     * Mounts the effort slider into the open model menu's effort row, then portals the track there.
+     * Rendered by the menu itself, so its lifetime matches "menu open".
+     * @returns {any} the portal, or null while the menu or the directory is not ready.
+     */
+    
+
+    // ---- agent teamwork lightning in the model row ---------------------------------------
+
+    
+
+    const MENU_CSS = [
+      /*
+       * The model row: hide its "模型" label, pull the name to the left, and park the lightning at
+       * the row's right edge (where the drill-down chevron used to be). The row itself must be
+       * position:relative — that is what anchors .tl-bolt; without it the bolt escapes to the menu.
+       */
+      '[role="menu"] > button[role="menuitem"]:has([data-provider-id]){position:relative;padding-right:46px}',
+      '[role="menu"] > button[role="menuitem"]:has([data-provider-id]) > span:first-child{display:none !important}',
+      '[role="menu"] > button[role="menuitem"]:has([data-provider-id]) > span:nth-child(2){',
+      'text-align:left !important;flex:0 1 auto !important;margin-right:0 !important}',
+      '.tl-inline{display:inline-flex;align-items:center;vertical-align:middle}',
+      '.tl-bolt{position:absolute;right:9px;top:50%;transform:translateY(-50%);',
+      'display:inline-flex;align-items:center;justify-content:center;width:30px;height:22px;',
+      'margin:0;padding:0;border:0;border-radius:6px;cursor:pointer;background:transparent;',
+      'color:var(--dsw-alias-label-tertiary,#9aa4b2);transition:color .12s ease,background .12s ease}',
+      '.tl-bolt:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06))}',
+      '.tl-bolt[data-on="1"]{color:#1e40af}',
+      '.tl-bolt[disabled]{opacity:.45;cursor:default}',
+      /* The effort slider draws a purple inset ring on its row; the user does not want it. */
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline){box-shadow:none !important;border-color:transparent !important}',
+      /* Official mode: hide the external plugin's slider so the shipped row shows through. */
+      'body[data-ct-effort="official"] .ces-inline{display:none !important}',
+      'body[data-ct-effort="official"] [role="menu"] button[role="menuitem"]:has(.ces-inline){',
+      'height:auto !important;flex-wrap:nowrap !important;padding-top:0 !important;padding-bottom:0 !important}',
+      'body[data-ct-effort="official"] [role="menu"] button[role="menuitem"]:has(.ces-inline) > *:not(.ces-inline){',
+      'display:flex !important}',
+      /* Restart control, parked in the window-controls row just left of the minimize button. */
+      '.ct-restart{position:fixed;right:150px;top:7px;z-index:2147482001;display:inline-flex;',
+      'align-items:center;justify-content:center;width:32px;height:26px;padding:0;border:0;',
+      'border-radius:4px;cursor:pointer;color:inherit;background:transparent;',
+      'transition:background .12s ease;',
+      '-webkit-app-region:no-drag;app-region:no-drag;pointer-events:auto}',
+      '.ct-restart:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06))}',
+      '.ct-restart:active{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.12))}',
+      '.ct-restart[disabled]{opacity:.45;cursor:default}',
+      '.ct-restart svg{transition:transform .35s cubic-bezier(.34,1.72,.5,1)}',
+      '.ct-restart:hover svg{transform:rotate(-180deg)}',
+    ].join('');
+
+    
+
+    /** Occupies the shipped team-switch cell so that row disappears entirely. */
+    
+
+/**
+     * @param {any} props - inline model-label props.
+     * @returns {any} the model name, plus the teamwork lightning in the menu.
+     */
+    function ModelLabelWithBolt(props) {
+      const model = props.model;
+      const name = model === undefined || model === null ? '' : (model.name ?? '');
+      const badgeText = model !== null && model !== undefined && model.badge !== undefined
+        && typeof model.badge.text === 'string' ? model.badge.text : null;
+      const nameNode = h('span', null, name, badgeText === null ? null : h('span', { style: { opacity: 0.7 } }, ` · ${badgeText}`));
+      const team = React.useSyncExternalStore(subscribeTeam, readTeam, readTeam);
+      const [pending, setPending] = React.useState(false);
+      if (props.placement !== 'menu' || team === null) return nameNode;
+      // Official mode: the lightning disappears and the shipped teamwork switch comes back.
+      if (settings.effortSliderOn === false) return nameNode;
+      const locked = props.locked === true;
+      const toggle = () => {
+        if (pending || locked) return;
+        const teams = pluginCtx.get('remote.agentTeams') ?? pluginCtx.get('remote')?.agentTeams;
+        if (!teams || team.sessionId === null) {
+          props.reportFailure?.('智能体团队协作服务不可用');
+          return;
+        }
+        setPending(true);
+        const next = !team.enabled;
+        Promise.resolve(teams.setEnabled(team.sessionId, next)).then((response) => {
+          if (response && response.ok === false) {
+            props.reportFailure?.(`无法切换智能体团队协作：${response.error?.message ?? '未知错误'}`);
+            return;
+          }
+          rememberTeamChoice(team.sessionId, next);
+          // Team on => both capacity sliders jump to Medium.
+          if (next) syncCapacityWithTeam('team-on');
+        }, (error) => {
+          props.reportFailure?.(`无法切换智能体团队协作：${error instanceof Error ? error.message : String(error)}`);
+        }).finally(() => { setPending(false); });
+      };
+      // A span, not a button: this label renders inside the model row's own <button>.
+      return h('span', { className: 'tl-inline' },
+        nameNode,
+        h('span', {
+          className: 'tl-bolt',
+          role: 'button',
+          tabIndex: 0,
+          'data-on': team.enabled ? '1' : '0',
+          'aria-pressed': team.enabled ? 'true' : 'false',
+          'aria-label': team.enabled ? '关闭智能体团队协作' : '开启智能体团队协作',
+          title: team.enabled ? '智能体团队协作：已开启（点击关闭）' : '智能体团队协作：已关闭（点击开启）',
+          'aria-disabled': locked || pending ? 'true' : 'false',
+          onClick: (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+          },
+          onKeyDown: (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+          },
+        }, h('svg', {
+          // Wider than tall on purpose: the bolt should read a bit broader, not thicker.
+          viewBox: '0 0 24 24', width: 24, height: 17, preserveAspectRatio: 'none',
+          'aria-hidden': true, fill: 'none',
+        }, h('path', {
+          d: 'M13.2 2.6 5.7 13.2h5l-1.4 8.2 8.1-10.9h-5l1.4-7.9Z',
+          stroke: 'currentColor',
+          /* Uniform ink: the horizontal stretch must widen the shape, not thicken its outline. */
+          strokeWidth: 1.4,
+          vectorEffect: 'non-scaling-stroke',
+          strokeLinejoin: 'round',
+          strokeLinecap: 'round',
+          fill: team.enabled ? 'currentColor' : 'none',
+          fillOpacity: team.enabled ? 0.25 : 0,
+        }))));
+    }
+
+    /**
+     * Hide the shipped "启用智能体团队协作" row in the model menu: the lightning replaces it.
+     * @returns {() => void} disposer.
+     */
+    /**
+     * While the slider is enabled, the shipped 推理等级 row must not drill into the official level
+     * list — the slider is the only control there. A capture-phase listener wins the race against
+     * React's own handler, and the slider's internal pointer handlers still work (they stop their
+     * own propagation first, and this only blocks the row itself).
+     * @returns {() => void} disposer.
+     */
+    function installReasonRowGuard() {
+      /** @param {Event} event - a click or keydown on the row. @returns {boolean} whether it was ours. */
+      const isReasonRow = (event) => {
+        if (settings.effortSliderOn === false) return false;
+        const target = event.target;
+        if (target === null || target === undefined || typeof target.closest !== 'function') return false;
+        const row = target.closest('button[role="menuitem"]');
+        if (row === null) return false;
+        return row.querySelector('.ces-inline') !== null;
+      };
+      const onClick = (event) => {
+        if (!isReasonRow(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      const onKeyDown = (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        if (!isReasonRow(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('keydown', onKeyDown, true);
+      return () => {
+        document.removeEventListener('click', onClick, true);
+        document.removeEventListener('keydown', onKeyDown, true);
+      };
+    }
+
+    function installTeamRowHider() {
+      const sweep = () => {
+        try {
+          // Official mode: the lightning is gone, so the shipped switch comes back.
+          if (settings.effortSliderOn === false) {
+            for (const node of document.querySelectorAll('[data-ct-team-hidden="1"]')) {
+              node.dataset.ctTeamHidden = '';
+              node.style.display = '';
+            }
+            return;
+          }
+          for (const node of document.querySelectorAll('[role="menu"] div')) {
+            if (node.dataset.ctTeamHidden === '1') continue;
+            const text = (node.textContent || '').trim();
+            if (!text.startsWith('启用智能体团队协作') && !text.startsWith('啟用智能體團隊協作')
+              && !text.startsWith('Enable agent teamwork')) continue;
+            // Only the row that actually carries a toggle, not a wrapper around several rows.
+            if (node.querySelector('[role="switch"], input[type="checkbox"], button[class*="toggle"], [class*="_toggle"]') === null) continue;
+            node.dataset.ctTeamHidden = '1';
+            node.style.display = 'none';
+          }
+        } catch {
+          // Cosmetic only.
+        }
+      };
+      sweep();
+      if (typeof MutationObserver === 'function' && document.body) {
+        const onMode = () => sweep();
+        window.addEventListener('ct-effort-mode', onMode);
+        const observer = new MutationObserver(() => sweep());
+        observer.observe(document.body, { childList: true, subtree: true });
+        return () => {
+          window.removeEventListener('ct-effort-mode', onMode);
+          observer.disconnect();
+        };
+      }
+      if (typeof setInterval !== 'function') return () => {};
+      const timer = setInterval(sweep, 500);
+      return () => clearInterval(timer);
+    }
+
+    // ---- settings page (Settings → 增强工具集) ------------------------------------------
+
+    const SETTINGS_CSS = [
+      '.ct-set{display:flex;flex-direction:column;padding:2px 0 8px;font-size:13px;',
+      'color:var(--dsw-alias-label-primary,#111)}',
+      '.ct-set-head{display:flex;flex-direction:column;gap:4px;padding-bottom:10px}',
+      '.ct-set-title{margin:0;font-size:15px;font-weight:600;line-height:1.3}',
+      '.ct-set-desc{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary,#666)}',
+      '.ct-set-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:12px 0;',
+      'border-top:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.1))}',
+      '.ct-set-row-column{flex-direction:column;align-items:stretch;gap:10px}',
+      '.ct-stops{display:flex;flex-wrap:wrap;gap:10px}',
+      '.ct-stop{display:flex;flex-direction:column;gap:3px;width:68px}',
+      '.ct-stop-label{font-size:10.5px;line-height:1.2;color:var(--dsw-alias-label-secondary,#666)}',
+      '.ct-stop-input{width:100%;padding:5px 7px}',
+      '.ct-set-copy{display:flex;flex-direction:column;gap:3px;min-width:0}',
+      '.ct-set-label{font-size:13px;font-weight:500}',
+      '.ct-set-hint{margin:0;font-size:11.5px;line-height:1.45;color:var(--dsw-alias-label-secondary,#666)}',
+      '.ct-set-input{width:112px;flex:none;padding:6px 8px;border-radius:8px;font:inherit;font-size:13px;',
+      'color:inherit;background:var(--dsw-alias-bg-layer-1,#fff);',
+      'border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.18))}',
+      '.ct-set-input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#3b82f6);outline-offset:1px}',
+      /* Beats .ct-set-input's fixed width, whatever order the two rules land in. */
+      '.ct-stops .ct-set-input{width:100%;flex:1 1 auto;padding:5px 7px}',
+      '.ct-set-switch{position:relative;flex:none;width:36px;height:20px;padding:0;border:0;border-radius:10px;',
+      'cursor:pointer;background:var(--dsw-alias-border-l1,rgba(15,17,21,.16));transition:background .15s ease}',
+      '.ct-set-switch[data-on="1"]{background:var(--dsw-alias-brand-primary,#3b82f6)}',
+      '.ct-set-knob{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;',
+      'box-shadow:0 1px 3px rgba(0,0,0,.28);transition:transform .15s ease}',
+      '.ct-set-switch[data-on="1"] .ct-set-knob{transform:translateX(16px)}',
+      '.ct-set-foot{display:flex;align-items:center;gap:10px;padding-top:12px;',
+      'border-top:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.1))}',
+      '.ct-set-reset{font:inherit;font-size:12px;padding:5px 10px;border-radius:8px;cursor:pointer;color:inherit;',
+      'background:var(--dsw-alias-bg-layer-1,#fff);border:1px solid var(--dsw-alias-border-1,rgba(0,0,0,.16))}',
+      '.ct-set-reset:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05))}',
+    ].join('');
+
+    /**
+     * @param {any} props - icon slot props.
+     * @returns {any} the settings navigation glyph.
+     */
+    function SettingsIcon(props) {
+      const size = props && Number.isFinite(props.size) ? props.size : 16;
+      return h('svg', {
+        viewBox: '0 0 24 24', width: size, height: size, fill: 'none', 'aria-hidden': true,
+      },
+      h('path', { d: 'M4 7h9M4 12h6M4 17h9', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' }),
+      h('path', {
+        d: 'M15.5 5.5l3.5 3.5-6.6 6.6-3.9.4.4-3.9 6.6-6.6Z',
+        stroke: 'currentColor', strokeWidth: 1.8, strokeLinejoin: 'round',
+      }));
+    }
+
+    /**
+     * @param {any} props - switch values.
+     * @returns {any} one on/off control.
+     *
+     * The knob keeps a local mirror of the value: the flip must never wait on (or depend on) the
+     * store round-trip, so a click always shows immediately even if a re-render is delayed.
+     */
+    function SettingsSwitch(props) {
+      const [local, setLocal] = React.useState(props.value === true);
+      React.useEffect(() => { setLocal(props.value === true); }, [props.value]);
+      const on = local === true;
+      return h('button', {
+        type: 'button',
+        role: 'switch',
+        'aria-checked': on ? 'true' : 'false',
+        'aria-label': props.label,
+        className: 'ct-set-switch',
+        'data-on': on ? '1' : '0',
+        onClick: () => {
+          const next = !on;
+          setLocal(next);
+          props.onChange(next);
+        },
+      }, h('span', { className: 'ct-set-knob' }));
+    }
+
+    /**
+     * Reads and writes ui-conversation's busyEnter — the very same "繁忙时的发送行为" as the row in
+     * Settings → General, surfaced here so it lives next to the composer controls.
+     * @returns {any} the switch.
+     */
+    function BusyEnterSwitch() {
+      const hostRef = React.useRef(null);
+      const [steer, setSteer] = React.useState(null);
+      React.useEffect(() => {
+        let disposed = false;
+        let retry = null;
+        let unsubscribe = null;
+        const attach = () => {
+          if (disposed) return;
+          let host = null;
+          try {
+            const forms = pluginCtx.get('configForms');
+            host = forms && typeof forms.get === 'function' ? forms.get('ui-conversation') : null;
+          } catch {
+            host = null;
+          }
+          if (host === null || typeof host.getSnapshot !== 'function') {
+            retry = setTimeout(attach, 600);
+            return;
+          }
+          hostRef.current = host;
+          const read = () => {
+            try {
+              setSteer(host.getSnapshot().value?.busyEnter === 'steer');
+            } catch {
+              // Keep the last known value.
+            }
+          };
+          read();
+          if (typeof host.subscribe === 'function') unsubscribe = host.subscribe(read);
+        };
+        attach();
+        return () => {
+          disposed = true;
+          if (retry !== null) clearTimeout(retry);
+          if (typeof unsubscribe === 'function') unsubscribe();
+        };
+      }, []);
+      return h(SettingsSwitch, {
+        value: steer === true,
+        label: 'Enter 插话发送',
+        onChange: (value) => {
+          setSteer(value);
+          const host = hostRef.current;
+          if (host !== null && typeof host.set === 'function') {
+            try {
+              host.set('busyEnter', value ? 'steer' : 'queue');
+            } catch {
+              // The next mount resyncs from the form.
+            }
+          }
+        },
+      });
+    }
+
+    // ---- custom team-capacity sliders (subagent limits) ------------------------------------
+    //
+    // `@deepseek-ai/dsh-subagent` carries two numeric knobs — maxActiveSubagents and maxDepth —
+    // that decide how wide and how deep delegation may go. Each gets a five-stop slider in the
+    // model menu; the numbers behind Low … Max are user-editable in Settings.
+
+
+    /**
+     * The host config form that owns the subagent knobs.
+     * @returns {any} the form host, or null while the settings service is not ready.
+     */
+    function subagentForm() {
+      let forms = null;
+      try {
+        forms = pluginCtx?.get?.('configForms') ?? null;
+      } catch {
+        forms = null;
+      }
+      if (forms === null || typeof forms.get !== 'function') return null;
+      try {
+        const direct = forms.get('subagent');
+        if (direct !== null && direct !== undefined && typeof direct.getSnapshot === 'function') return direct;
+      } catch {
+        // Fall through to the descriptor scan.
+      }
+      try {
+        const described = typeof forms.describe === 'function' ? forms.describe() : null;
+        const sections = Array.isArray(described?.sections) ? described.sections : [];
+        for (const section of sections) {
+          const id = typeof section?.id === 'string' ? section.id : (typeof section?.entryId === 'string' ? section.entryId : '');
+          if (!id.includes('subagent')) continue;
+          const host = forms.get(id);
+          if (host !== null && host !== undefined && typeof host.getSnapshot === 'function') return host;
+        }
+      } catch {
+        // No descriptor support: the sliders stay read-only.
+      }
+      return null;
+    }
+
+    /**
+     * Five-stop slider for a numeric host setting.
+     * @param {any} props - stops, current value, and commit callback.
+     * @returns {any} the control.
+     */
+    
+
+    
+    
+
+    
+
+    
+
+    
+
+
+    /** The Settings section this package contributes to the Settings dialog. */
+    
+
+    function SettingsSection() {
+      const current = React.useSyncExternalStore(subscribeSettings, readSettings, readSettings);
+      const [draft, setDraft] = React.useState(String(current.threshold));
+      React.useEffect(() => { setDraft(String(current.threshold)); }, [current.threshold]);
+      const commitThreshold = () => {
+        const value = Number(draft);
+        if (!Number.isFinite(value) || value < 0) {
+          setDraft(String(current.threshold));
+          return;
+        }
+        updateSettings({ threshold: Math.floor(value) });
+      };
+      return h('div', { className: 'ct-set' },
+        h('div', { className: 'ct-set-head' },
+          h('h2', { className: 'ct-set-title' }, '增强工具集'),
+          h('p', { className: 'ct-set-desc' }, '粘贴转换、图片标注、Enter 插话、推理滑条与团队协作。修改立即生效，并按浏览器保存。')),
+        h('div', { className: 'ct-set-row' },
+          h('div', { className: 'ct-set-copy' },
+            h('div', { className: 'ct-set-label' }, '表格粘贴转 Excel'),
+            h('div', { className: 'ct-set-hint' }, 'Tab 分隔、至少 2 行 × 2 列的内容存成 .xlsx 附件。')),
+          h(SettingsSwitch, {
+            value: current.tableToXlsx,
+            label: '表格粘贴转 Excel',
+            onChange: (value) => updateSettings({ tableToXlsx: value }),
+          })),
+        h('div', { className: 'ct-set-row' },
+          h('div', { className: 'ct-set-copy' },
+            h('div', { className: 'ct-set-label' }, '长文本转 txt 门槛'),
+            h('div', { className: 'ct-set-hint' }, '达到或超过该字数才转存成 .txt；0 表示关闭这项转存。')),
+          h('input', {
+            className: 'ct-set-input',
+            type: 'number', min: 0, step: 50,
+            value: draft,
+            'aria-label': '长文本转 txt 门槛（字）',
+            onChange: (event) => setDraft(event.target.value),
+            onBlur: commitThreshold,
+            onKeyDown: (event) => {
+              if (event.key !== 'Enter') return;
+              event.preventDefault();
+              commitThreshold();
+            },
+          })),
+                h('div', { className: 'ct-set-row' },
+          h('div', { className: 'ct-set-copy' },
+            h('div', { className: 'ct-set-label' }, 'Enter 插话发送'),
+            h('div', { className: 'ct-set-hint' }, '智能体运行中按 Enter 立即插话；关闭则排队，等本轮结束再发送。与「设置 → 通用 → 繁忙时的发送行为」是同一项。')),
+          h(BusyEnterSwitch)),
+        h('div', { className: 'ct-set-row' },
+          h('div', { className: 'ct-set-copy' },
+            h('div', { className: 'ct-set-label' }, '推理等级用滑条'),
+            h('div', { className: 'ct-set-hint' }, '开：模型菜单里用可拖动的滑条，模型行的 ⚡ 一键切换团队协作。关：恢复官方原样——点「推理等级」进入官方档位列表，团队协作仍是官方开关。')),
+          h(SettingsSwitch, {
+            value: current.effortSliderOn !== false,
+            label: '推理等级用滑条',
+            onChange: (value) => updateSettings({ effortSliderOn: value }),
+          })),
+        h('div', { className: 'ct-set-foot' },
+          h('button', {
+            type: 'button', className: 'ct-set-reset',
+            onClick: () => { resetSettings(); },
+          }, '恢复默认'),
+          h('span', { className: 'ct-set-hint' }, '默认值来自插件配置。')));
+    }
+
+    /** Storage key proving the one-time preference below already ran in this browser profile. */
+    const PREFS_ENTER_MARK = 'dsh-slick:prefs:busy-enter';
+
+    /**
+     * Write the one preference the user asked for, once, through the owning plugin's own knob — so a
+     * later manual change is never fought again on the next load: Enter while the agent runs should
+     * interject (send now) instead of queueing, i.e. ui-conversation's "繁忙时的发送行为" setting
+     * (`busyEnter`, queue | steer).
+     * @param {any} ctx - client plugin context.
+     * @returns {void} nothing.
+     */
+    function applyOncePreferences(ctx) {
+      let storage = null;
+      try {
+        storage = window.localStorage ?? null;
+      } catch {
+        storage = null;
+      }
+      if (storage === null) return;
+
+      // The settings service may still be mounting, so retry a few times before giving up; the mark
+      // is only written once the write actually landed.
+      try {
+        if (storage.getItem(PREFS_ENTER_MARK) !== '1') {
+          const attempt = (left) => {
+            let landed = false;
+            try {
+              const forms = ctx.get('configForms');
+              const host = forms && typeof forms.get === 'function' ? forms.get('ui-conversation') : undefined;
+              if (host !== undefined && host !== null && typeof host.set === 'function') {
+                const section = typeof host.getSnapshot === 'function' ? host.getSnapshot().value : undefined;
+                if (section === undefined || section.busyEnter !== 'steer') host.set('busyEnter', 'steer');
+                landed = true;
+              }
+            } catch {
+              // The settings service is unavailable for now.
+            }
+            if (landed) {
+              try {
+                storage.setItem(PREFS_ENTER_MARK, '1');
+              } catch {
+                // Failing to remember only means we try again next load.
+              }
+              return;
+            }
+            if (left > 0) setTimeout(() => attempt(left - 1), 1500);
+          };
+          attempt(4);
+        }
+      } catch {
+        // No storage: nothing to remember.
+      }
+    }
+
+    return {
+      name: PACKAGE,
+      // The reference implementation declares all five: without modelDirectories + the remote
+      // bindings, directoryFor() resolves no session scope and the level list comes back empty.
+      inject: ['slots', 'sessions', 'modelDirectories', 'remote', 'remote.session'],
+      apply(ctx, config) {
+        const configured = Number(config?.threshold);
+        settingsBase = {
+          ...SETTINGS_DEFAULTS,
+          threshold: Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : SETTINGS_DEFAULTS.threshold,
+          autoSendImage: config?.autoSendImage !== false,
+        };
+        settings = mergeStoredSettings(settingsBase);
+        pluginCtx = ctx;
+        applyOncePreferences(ctx);
+        ctx.effect(() => {
+          const style = document.createElement('style');
+          style.textContent = CSS;
+          document.head.appendChild(style);
+          return () => style.remove();
+        });
+        ctx.effect(() => {
+          const style = document.createElement('style');
+          style.textContent = MENU_CSS;
+          document.head.appendChild(style);
+          return () => style.remove();
+        });
+        // The switch in Settings picks which reasoning UI is live; the attribute is what the
+        // stylesheet keys on, and the teamwork-row hider only runs in slider mode.
+        ctx.effect(() => {
+          const apply = () => {
+            const body = document.body;
+            if (body === null || body === undefined) return;
+            body.dataset.ctEffort = settings.effortSliderOn === false ? 'official' : 'slider';
+          };
+          apply();
+          const stopHide = installTeamRowHider();
+          const stopGuard = installReasonRowGuard();
+          const unsubscribe = subscribeSettings(() => {
+            apply();
+            // Mode may have flipped; one sweep is enough to hide or restore the row.
+            if (typeof window !== 'undefined') window.dispatchEvent(new Event('ct-effort-mode'));
+          });
+          return () => {
+            unsubscribe();
+            if (typeof stopHide === 'function') stopHide();
+            if (typeof stopGuard === 'function') stopGuard();
+          };
+        });
+        // The lightning sits in the model row, right after the model name.
+        ctx.slots.inject('conversation.input.model.label', () => ctx.slots.register({
+          name: 'conversation.input.model.label',
+          label: 'Model name with teamwork lightning',
+        }, ModelLabelWithBolt));
+        // One page in the Settings dialog: Settings → 增强工具集.
+        ctx.effect(() => {
+          const style = document.createElement('style');
+          style.textContent = SETTINGS_CSS;
+          document.head.appendChild(style);
+          return () => style.remove();
+        });
+        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: 'dsh-slick',
+          order: 50,
+          label: () => '增强工具集',
+        }, SettingsSection)));
+        ctx.effect(() => ctx.slots.inject('settings.section.icon', () => ctx.slots.register({
+          name: 'settings.section.icon',
+          id: 'dsh-slick',
+        }, SettingsIcon)));
+
+        // Invisible latch: keeps the composer's public actions and teamwork state reachable
+        // from the frame-wide overlay, which has no Session scope of its own.
+        ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
+          name: 'conversation.input.overlay',
+          id: `${PACKAGE}:latch`,
+          label: 'Composer tools latch',
+        }, InputActionsLatch));
+        ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: `${PACKAGE}:editor`,
+          order: 40,
+          label: 'Image annotation editor',
+        }, EditorOverlay)));
+        ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: `${PACKAGE}:notice`,
+          order: 42,
+          label: 'Composer tools notice',
+        }, NoticeTip)));
+        ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: `${PACKAGE}:build`,
+          order: 43,
+          label: 'Composer tools build badge',
+        }, LoadBadge)));
+        ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: `${PACKAGE}:restart`,
+          order: 44,
+          label: 'Composer tools restart button',
+        }, RestartButton)));
+
+        // Paste: a tab-separated table becomes a real .xlsx, a long text becomes a .txt.
+        const onPaste = (event) => {
+          if (event.defaultPrevented || event.isComposing === true) return;
+          const target = event.target;
+          if (!(target instanceof Element) || !isComposerEditor(target)) return;
+          const clipboard = event.clipboardData;
+          if (clipboard === null) return;
+          const text = clipboard.getData('text/plain');
+          if (text === '') return;
+          const sessionId = currentSessionId(ctx);
+          if (sessionId === null) return;
+          let file = null;
+          if (settings.tableToXlsx && FORMAT.detectTable(text) !== null) {
+            const spec = FORMAT.planFor(text);
+            if (spec !== null) file = new File([spec.bytes], spec.name, { type: spec.mime });
+          } else if (settings.threshold > 0 && text.length >= settings.threshold) {
+            file = new File([text], `pasted-text-${fileStamp(new Date())}.txt`, { type: 'text/plain;charset=utf-8' });
+          }
+          if (file === null) return;
+          // Intercept: the raw chunk must not also land in the composer.
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          const produced = file;
+          attachImage(sessionId, produced, null).then((attached) => {
+            if (attached.result === 'ok') {
+              showNotice(`已存成 ${produced.name}`);
+              return;
+            }
+            const inserted = insertRawText(target, text);
+            showNotice(
+              inserted ? `轉存檔未成功（${attached.result}），已按原樣貼上` : '轉存檔未成功，內容仍在剪貼簿',
+              'error',
+            );
+          }).catch(() => {
+            const inserted = insertRawText(target, text);
+            showNotice(inserted ? '轉存檔未成功，已按原樣貼上' : '轉存檔未成功，內容仍在剪貼簿', 'error');
+          });
+        };
+        document.addEventListener('paste', onPaste, true);
+        ctx.effect(() => () => document.removeEventListener('paste', onPaste, true));
+
+        // A click on a composer draft image opens the editor instead of the read-only preview.
+        const onClick = (event) => {
+          const target = event.target;
+          if (!(target instanceof Element)) return;
+          const image = target.closest('img');
+          if (image === null || !isDraftImage(image)) return;
+          const source = image.getAttribute('src');
+          if (source === null || source === '') return;
+          if (currentSessionId(ctx) === null) return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          setHoverSpot(null);
+          openFromSource(source, ctx);
+        };
+        document.addEventListener('click', onClick, true);
+        ctx.effect(() => () => document.removeEventListener('click', onClick, true));
+      },
+    };
+  },
+});
