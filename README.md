@@ -17,7 +17,7 @@ paste-to-file conversion, in-place image annotation, Enter-to-steer, and a Codex
 | **长文本转 txt** | 超过阈值（默认 500 字）的纯文本自动存成 `.txt` 附件，保持输入框清爽。阈值可调，0 表示关闭。 |
 | **图片标注** | 点草稿里的图片缩略图打开标注编辑器：画笔、方框、圆圈、直线、箭头、橡皮擦；可移动、可缩放；滚轮缩放画布；撤销 / 重做 / 清空。保存后得到一张新图片。 |
 | **Enter 插话发送** | 智能体运行中按 Enter 立即插话（steer），而不是排队等本轮结束。与「设置 → 通用 → 繁忙时的发送行为」是同一项。 |
-| **推理等级滑条** | 把模型菜单里的「推理等级」那一行换成一条可拖动的连续滑条（Codex 风格）。开关可切回官方档位列表。 |
+| **推理等级滑条** | 把模型菜单里的「推理等级」那一行换成一条可拖动的连续滑条（Codex 风格），拖到高档会有紫色能量流动与星尘。开关可切回官方档位列表。 |
 | **智能体团队协作** | 模型行右侧的 ⚡ 一键开 / 关团队协作，无需确认弹窗；开启时官方那一行开关会被隐藏，避免重复。 |
 
 所有开关都在 **设置 → 增强工具集** 里，修改立即生效，并按浏览器保存。
@@ -38,7 +38,7 @@ paste-to-file conversion, in-place image annotation, Enter-to-steer, and a Codex
 ### 1. 放到本地
 
 ```bash
-git clone https://github.com/Sam/dsh-slick.git
+git clone https://github.com/chen060627/dsh-slick.git
 ```
 
 ### 2. 挂到 profile
@@ -71,7 +71,7 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\profiles\desktop\node_m
 
 **完全退出并重开 DSH Desktop**（关窗口不够，要退出进程）后生效。
 
-> ⚠️ 推理等级滑条依赖 [`dsh-codex-effort-slider`](https://github.com/Microqian2th/dsh-codex-effort-slider) 提供滑动控件本身；不装它时「推理等级用滑条」开关不起作用，其余功能不受影响。装上后建议把它加入 `bundles`。
+推理等级滑条已内嵌在本插件里，**不需要再安装第二个插件**。来源与许可见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
 
 ---
 
@@ -92,7 +92,8 @@ index.js            host 半：系统提示词段落、/dsh-slick/* 路由（重
 client.js           生成的浏览器端 bundle（勿手改）
 src/format.js       纯逻辑：表格识别、长文本判定、无依赖 XLSX 写出
 src/client-body.js  浏览器端 UI：设置页、标注编辑器、模型菜单增强
-scripts/build.mjs   构建脚本
+src/codex-slider.js 内嵌的推理等级滑条（来自 dsh-codex-effort-slider，MIT）
+scripts/build.mjs   构建脚本（把 format.js 与 codex-slider.js 内联进 client.js）
 locale/             zh / en 文案
 docs/               插件详情页说明
 icon.svg            插件图标

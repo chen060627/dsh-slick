@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     /** Table and long-text decisions from the inlined format module. */
     const FORMAT = globalThis.__composerToolsFormat;
+    /*__CODEX_SLIDER__*/
 
     /** Client plugin context, captured at apply time. */
     let pluginCtx = null;
@@ -2444,6 +2445,14 @@ window.__ModuleLoader__.load({
         settings = mergeStoredSettings(settingsBase);
         pluginCtx = ctx;
         applyOncePreferences(ctx);
+        // The effort slider itself is vendored from dsh-codex-effort-slider (MIT), so this one
+        // plugin supplies it; official mode hides it via the body attribute below.
+        try {
+          CODEX_SLIDER.apply(ctx);
+        } catch (error) {
+          // A broken slider must never take the rest of the kit down with it.
+          try { console.error('[dsh-slick] effort slider failed to start:', error); } catch { /* ignore */ }
+        }
         ctx.effect(() => {
           const style = document.createElement('style');
           style.textContent = CSS;

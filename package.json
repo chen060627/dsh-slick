@@ -16,7 +16,9 @@
     "cordis.patch.yml",
     "locale/*.json",
     "docs",
-    "icon.svg"
+    "icon.svg",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "dsh": {
     "bundle": {
@@ -29,7 +31,7 @@
   },
   "license": "MIT",
   "author": {
-    "name": "Sam"
+    "name": "chen060627"
   },
   "keywords": [
     "deepseek-harness",
@@ -43,13 +45,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sam/dsh-slick.git"
+    "url": "git+https://github.com/chen060627/dsh-slick.git"
   },
   "bugs": {
-    "url": "https://github.com/Sam/dsh-slick/issues"
+    "url": "https://github.com/chen060627/dsh-slick/issues"
   },
-  "homepage": "https://github.com/Sam/dsh-slick#readme",
+  "homepage": "https://github.com/chen060627/dsh-slick#readme",
   "engines": {
     "dsh": "*"
-  }
+  },
+  "dependencies": {}
 }
