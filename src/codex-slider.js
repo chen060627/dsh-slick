@@ -36,6 +36,26 @@ const CODEX_SLIDER = (function codexSliderModule(require) {
     var RETRY_DELAYS = [60, 240, 540, 960, 1500, 3000, 3000];
     var STYLE_MARKER = PACKAGE_ID;
 
+    /**
+     * External on/off gate. The host plugin flips this when the user switches the reasoning UI
+     * between "slider" and "official"; returning false makes the bridge detach completely
+     * (row styles restored, container removed) so the official row is left untouched.
+     */
+    var modeGate = function () { return true; };
+    /** Every live bridge, so a mode flip can re-scan immediately (no DOM mutation to react to). */
+    var liveBridges = [];
+
+    /**
+     * @param {() => boolean} gate - returns whether the slider should be mounted.
+     * @returns {void} nothing.
+     */
+    function setModeGate(gate) {
+      modeGate = typeof gate === "function" ? gate : function () { return true; };
+      for (var i = 0; i < liveBridges.length; i += 1) {
+        try { liveBridges[i].scan(); } catch (error) { /* 单个桥失败不影响其它 */ }
+      }
+    }
+
     /* ── 尺寸与速率常量：**必须声明在 CSS 数组之前**，因为样式表要插值它们 ──
        （踩过一次：CSS 数组先于常量求值，样式里写进去的是 `height:undefinedpx`，
        真机上轨道会塌成 0 高。测试里对轨道高/旋钮直径的断言就是为这个加的。） */
@@ -1943,16 +1963,19 @@ const CODEX_SLIDER = (function codexSliderModule(require) {
           doc: typeof document === "undefined" ? null : document,
           win: typeof window === "undefined" ? null : window,
           anchor: function () { return anchorRef.current; },
-          active: function () { return levelCountRef.current > 0; },
+          active: function () { return levelCountRef.current > 0 && modeGate(); },
           onChange: function (next) { setHost(next); },
           // 收起态那一行显示的档位名（官方 trigger 里的文字就是它）；给全部名字更抗"官方还没重渲染"
           seatLabels: function () { return seatNamesRef.current; },
         });
         if (bridge === null) return undefined;
         bridgeRef.current = bridge;
+        liveBridges.push(bridge);
         bridge.start();
         return function () {
           bridgeRef.current = null;
+          var at = liveBridges.indexOf(bridge);
+          if (at >= 0) liveBridges.splice(at, 1);
           bridge.dispose();
         };
       }, [ctx, sessionId]);
@@ -2829,6 +2852,7 @@ const CODEX_SLIDER = (function codexSliderModule(require) {
       CSS: CSS,
       SLOT_NAME: SLOT_NAME,
       ENTRY_ID: ENTRY_ID,
+      setModeGate: setModeGate,
       PARTICLES: PARTICLES,
       ROW_PADDING_BLOCK: ROW_PADDING_BLOCK,
       EFFORT_ROW_LABELS: EFFORT_ROW_LABELS,

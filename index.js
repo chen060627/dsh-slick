@@ -433,12 +433,18 @@ function handleRestartRequest(ctx, req, res) {
     sendJson(res, 403, { ok: false, error: 'loopback only' })
     return
   }
+  const capability = restartCapability()
   if (req.method === 'GET') {
-    sendJson(res, 200, { ok: true, armed: true })
+    sendJson(res, 200, { ok: true, armed: capability.ok, reason: capability.reason ?? null })
     return
   }
   if (req.method !== 'POST') {
     sendJson(res, 405, { ok: false, error: 'method not allowed' }, { allow: 'GET, POST' })
+    return
+  }
+  if (!capability.ok) {
+    // Refuse loudly: killing the wrong process here costs the user their whole session.
+    sendJson(res, 501, { ok: false, error: 'restart unsupported', reason: capability.reason ?? null })
     return
   }
   let helper
@@ -498,6 +504,30 @@ function sendJson(res, status, body, headers = {}) {
       // The socket is already unusable.
     }
   }
+}
+
+/**
+ * Decide whether this host may restart the app at all.
+ *
+ * Only the Windows desktop build has a proven relaunch path. Everywhere else the "parent
+ * process" is not reliably the app — on Linux it can be the login shell or `systemd --user`,
+ * and terminating that takes the whole session down (browser, remote desktop, other apps).
+ * So the feature is refused outright instead of guessing.
+ *
+ * @returns {{ ok: boolean, reason?: string }} whether a restart is safe here.
+ */
+function restartCapability() {
+  if (process.platform !== 'win32') {
+    return { ok: false, reason: 'auto-restart is only supported on Windows; please restart DSH manually' }
+  }
+  if (process.versions === undefined || process.versions.electron === undefined) {
+    return { ok: false, reason: 'auto-restart needs the desktop app; please restart DSH manually' }
+  }
+  const target = resolveRestartTargetPid()
+  if (!Number.isInteger(target) || target <= 1 || target === process.pid) {
+    return { ok: false, reason: 'could not identify the app process; please restart DSH manually' }
+  }
+  return { ok: true }
 }
 
 /**
@@ -588,16 +618,13 @@ function buildWindowsRestartCommand(targetPid, executable) {
  * @returns {{ command: string, args: string[] }} The helper invocation.
  */
 function buildRestartCommand(targetPid, executable) {
-  if (process.platform === 'win32') {
-    return buildWindowsRestartCommand(targetPid, executable)
+  // Windows-only on purpose. There used to be a POSIX branch that ran
+  // `kill -TERM <ppid>`: on Linux the host's parent can be the login shell or `systemd --user`,
+  // so that killed the user's whole session instead of restarting DSH. Never bring it back.
+  if (process.platform !== 'win32') {
+    throw new Error('auto-restart is only supported on Windows')
   }
-  const script = [
-    `sleep ${RESTART_ARM_DELAY_MS / 1000}`,
-    `kill -TERM ${targetPid} 2>/dev/null`,
-    `sleep ${RESTART_RELAUNCH_DELAY_SECONDS}`,
-    `exec '${escapePosixSingleQuoted(executable)}'`,
-  ].join('; ')
-  return { command: '/bin/sh', args: ['-c', script] }
+  return buildWindowsRestartCommand(targetPid, executable)
 }
 
 /**
@@ -638,16 +665,6 @@ function spawnRestartHelper(ctx, helper) {
  */
 function escapePowerShellLiteral(value) {
   return String(value).replace(/'/g, "''")
-}
-
-/**
- * Escape a value for a POSIX shell single-quoted literal.
- *
- * @param {string} value Raw value.
- * @returns {string} The value, safe between single quotes.
- */
-function escapePosixSingleQuoted(value) {
-  return String(value).replace(/'/g, "'\\''")
 }
 
 /**

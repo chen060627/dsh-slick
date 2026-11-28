@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
 
     const PACKAGE = 'dsh-slick';
     /** Build stamp: proves which bundle the page actually loaded. */
-    const BUILD = 'dsh-slick-1.0.0';
+    const BUILD = 'dsh-slick-1.1.0';
     const React = require('react');
     const ReactDOM = require('react-dom');
     const h = React.createElement;
@@ -1713,9 +1713,21 @@ window.__ModuleLoader__.load({
     /** Path of the host endpoint that performs the restart. */
     const RESTART_ENDPOINT = '/dsh-slick/restart';
 
+    /** How long the button stays disabled after a click that did not restart the app. */
+    const RESTART_REARM_MS = 2500;
+
     /**
-     * Ask the host to relaunch DSH: close the app, wait three seconds, start it again.
-     * The host answers 202 before it acts, so the click always feels instant.
+     * Read the host's JSON answer, tolerating a missing or malformed body.
+     * @param {Response} response - the fetch response.
+     * @returns {Promise<any|null>} the parsed payload, or null.
+     */
+    function readPayload(response) {
+      return Promise.resolve(response.json()).then((payload) => payload ?? null, () => null);
+    }
+
+    /**
+     * Ask the host to relaunch DSH. The host answers 202 before it acts, so the click feels
+     * instant; a refusal carries a reason the user can act on.
      * @returns {void} nothing.
      */
     function requestRestart() {
@@ -1728,7 +1740,13 @@ window.__ModuleLoader__.load({
         return;
       }
       Promise.resolve(request).then((response) => {
-        if (response.ok !== true) showNotice(`重啟失敗（HTTP ${String(response.status)}）`, 'error');
+        if (response.ok === true) return;
+        // The host refuses when it cannot identify the app process safely — on Linux the parent
+        // it could signal may be the login session, so it declines rather than guessing.
+        return readPayload(response).then((payload) => {
+          const reason = typeof payload?.reason === 'string' ? payload.reason : null;
+          showNotice(reason === null ? `重啟失敗（HTTP ${String(response.status)}）` : `重啟失敗：${reason}`, 'error');
+        });
       }, () => showNotice('重啟失敗：無法連線到本機服務', 'error'));
     }
 
@@ -1750,19 +1768,25 @@ window.__ModuleLoader__.load({
     function RestartButton() {
       const armed = React.useSyncExternalStore(subscribeRestart, readRestart, readRestart);
       const [busy, setBusy] = React.useState(false);
+      /** Pending "release the button" timer, cleared on unmount so it never fires into nothing. */
+      const release = React.useRef(null);
+
+      // Ask the host once whether a restart is safe on this platform. Only the host knows: on
+      // Linux the "parent process" it could signal is the login session, so it refuses outright.
       React.useEffect(() => {
-        let disposed = false;
-        const probe = () => {
-          fetch(RESTART_ENDPOINT, { method: 'GET', cache: 'no-store' }).then((response) => {
-            if (disposed) return;
-            setRestartArmed(response.ok === true);
-          }, () => {
-            if (!disposed) setRestartArmed(false);
-          });
-        };
-        probe();
-        return () => { disposed = true; };
+        let cancelled = false;
+        const settle = (value) => { if (!cancelled) setRestartArmed(value); };
+        fetch(RESTART_ENDPOINT, { method: 'GET', cache: 'no-store' })
+          .then((response) => (response.ok === true ? readPayload(response) : null))
+          .then((payload) => settle(payload !== null && payload?.armed === true))
+          .catch(() => settle(false));
+        return () => { cancelled = true; };
       }, []);
+
+      React.useEffect(() => () => {
+        if (release.current !== null) clearTimeout(release.current);
+      }, []);
+
       if (!armed) return null;
       return h('button', {
         type: 'button',
@@ -1774,16 +1798,29 @@ window.__ModuleLoader__.load({
           if (busy) return;
           setBusy(true);
           requestRestart();
-          setTimeout(() => setBusy(false), 2500);
+          // The app goes away when this works, so the release is only for the refusal case.
+          release.current = setTimeout(() => {
+            release.current = null;
+            setBusy(false);
+          }, RESTART_REARM_MS);
         },
-      }, h('svg', { viewBox: '0 0 24 24', width: 14, height: 14, fill: 'none', 'aria-hidden': true },
+      }, h(RestartIcon));
+    }
+
+    /**
+     * Circular-arrow glyph for the restart button: a ring with a gap across the top plus a solid
+     * arrowhead tangent to the ring, so it reads as "rotate" rather than as a letter.
+     * @returns {any} the svg element.
+     */
+    function RestartIcon() {
+      return h('svg', { viewBox: '0 0 24 24', width: 14, height: 14, fill: 'none', 'aria-hidden': true },
         h('path', {
-          d: 'M4 12a8 8 0 1 1 2.6 5.9M4 12V6m0 6h6',
+          d: 'M15.21 5.11A7.6 7.6 0 1 1 8.79 5.11',
           stroke: 'currentColor',
-          strokeWidth: 2,
+          strokeWidth: 1.9,
           strokeLinecap: 'round',
-          strokeLinejoin: 'round',
-        })));
+        }),
+        h('path', { d: 'M11.69 3.76 9.64 6.92 7.94 3.30Z', fill: 'currentColor' }));
     }
 
     /** Short-lived chip naming the loaded build; disappears on its own. */
@@ -1931,12 +1968,23 @@ window.__ModuleLoader__.load({
       '.tl-bolt[disabled]{opacity:.45;cursor:default}',
       /* The effort slider draws a purple inset ring on its row; the user does not want it. */
       '[role="menu"] button[role="menuitem"]:has(.ces-inline){box-shadow:none !important;border-color:transparent !important}',
-      /* Official mode: hide the external plugin's slider so the shipped row shows through. */
-      'body[data-ct-effort="official"] .ces-inline{display:none !important}',
-      'body[data-ct-effort="official"] [role="menu"] button[role="menuitem"]:has(.ces-inline){',
-      'height:auto !important;flex-wrap:nowrap !important;padding-top:0 !important;padding-bottom:0 !important}',
-      'body[data-ct-effort="official"] [role="menu"] button[role="menuitem"]:has(.ces-inline) > *:not(.ces-inline){',
-      'display:flex !important}',
+      /*
+       * The slider row is not a navigation target: its click is deliberately swallowed, so it must
+       * not paint the "you can open me" hover highlight either. Kill the background on every state
+       * the shipped menu styles (hover / focus / focus-visible / active) and drop the pointer.
+       */
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline),',
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline):hover,',
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline):focus,',
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline):focus-visible,',
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline):active{',
+      'background:none !important;background-color:transparent !important;box-shadow:none !important;',
+      'border-color:transparent !important;cursor:default !important}',
+      /* The slider itself still needs its own pointer behaviour. */
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline) .ces-inline{cursor:default}',
+      /* No drill-down any more: drop the chevron (it is a direct <svg>, or wrapped in a span). */
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline) > svg,',
+      '[role="menu"] button[role="menuitem"]:has(.ces-inline) > span:last-child > svg{display:none !important}',
       /* Restart control, parked in the window-controls row just left of the minimize button. */
       '.ct-restart{position:fixed;right:150px;top:7px;z-index:2147482001;display:inline-flex;',
       'align-items:center;justify-content:center;width:32px;height:26px;padding:0;border:0;',
@@ -2474,11 +2522,21 @@ window.__ModuleLoader__.load({
             body.dataset.ctEffort = settings.effortSliderOn === false ? 'official' : 'slider';
           };
           apply();
+          // Official mode must UNMOUNT the slider: a hidden-but-live slider keeps restyling the
+          // row and swallowing its clicks, which reads as "greyed out but looks clickable".
+          try {
+            CODEX_SLIDER.__internals.setModeGate(() => settings.effortSliderOn !== false);
+          } catch (error) {
+            try { console.error('[dsh-slick] could not set the slider mode gate:', error); } catch { /* ignore */ }
+          }
           const stopHide = installTeamRowHider();
           const stopGuard = installReasonRowGuard();
           const unsubscribe = subscribeSettings(() => {
             apply();
-            // Mode may have flipped; one sweep is enough to hide or restore the row.
+            // Re-apply the gate, then let the row hider re-sweep for the new mode.
+            try {
+              CODEX_SLIDER.__internals.setModeGate(() => settings.effortSliderOn !== false);
+            } catch { /* the slider simply keeps its previous state */ }
             if (typeof window !== 'undefined') window.dispatchEvent(new Event('ct-effort-mode'));
           });
           return () => {
